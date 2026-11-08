@@ -1652,12 +1652,21 @@ impl eframe::App for FiveKdApp {
                         draw_pixel_5_icon(ui, 36.0, accent_green);
                         ui.add_space(10.0);
                         ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new("5KD - 5wi's Kick Downloader")
-                                    .size(19.0)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("5KD - 5wi's Kick Downloader")
+                                        .size(19.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                                ui.label(
+                                    RichText::new("1.0v")
+                                        .size(12.5)
+                                        .family(FontFamily::Monospace)
+                                        .strong()
+                                        .color(accent_green),
+                                );
+                            });
                             ui.label(
                                 RichText::new(
                                     "High-performance Kick.com VOD & clip downloader written in Rust.",

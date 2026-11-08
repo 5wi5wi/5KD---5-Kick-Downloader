@@ -1,18 +1,20 @@
-name: Build & Release Windows EXE
+name: Release 1.0v (Windows EXE)
 
 on:
   push:
     branches: [ main, master ]
     tags:
+      - '1.0v'
       - 'v*'
+      - '*v'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-windows-exe:
-    name: Build 5KD.exe (Windows x64)
+  release-windows-exe:
+    name: Build & Publish 5KD.exe (1.0v)
     runs-on: windows-latest
 
     steps:
@@ -28,22 +30,31 @@ jobs:
       - name: Build optimized release binary (5KD.exe)
         run: cargo build --release
 
-      - name: Upload 5KD.exe Artifact
+      - name: Upload 5KD.exe Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 5KD-windows-x64
+          name: 5KD-1.0v-windows-x64
           path: target/release/5KD.exe
 
-      - name: Create GitHub Release (on tag push or manual run)
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+      - name: Publish GitHub Release (1.0v)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name == 'main' || github.ref_name == 'master' ? 'v1.0.0' : github.ref_name }}
-          name: "5KD - 5wi's Kick Downloader (${{ github.ref_name }})"
+          tag_name: 1.0v
+          name: "5KD - 5wi's Kick Downloader (1.0v)"
           body: |
-            ### 5KD — 5wi's Kick Downloader (Windows x64 Release)
-            - Standalone native Rust executable (`5KD.exe`) with integrated Kick VOD M3U8 extractor.
-            - Requires `yt-dlp` and `ffmpeg` installed in your Windows `PATH`.
+            ## 5KD — 5wi's Kick Downloader `1.0v`
+
+            ### Highlights
+            - **Native Rust Desktop App (`5KD.exe`)**: Built with `eframe`/`egui` with embedded `#00e701` pixel-art `5` icon.
+            - **Integrated Kick VOD M3U8 Extractor**: Automatically resolves both `v1/video/{uuid}` and modern UUIDv7 `v2/channels/{user}/videos` VODs, plus CDN prefix scanning (`prefixes.json`).
+            - **Multi-Threaded HLS Engine**: Powered by `yt-dlp` (`-N 8`) and `ffmpeg` with custom browser headers.
+            - **Lossless Time Slicing**: Download specific segments using Start Time (`-ss`) and End Time (`-to`).
+            - **Queue & Process Control**: Output folder enforcement and one-click **Cancel** for active downloads.
+            - **UI Scaling**: Top-bar zoom controls (`100%` to `150%`).
+
+            ### Requirements
+            - Windows 10/11 (64-bit)
+            - `yt-dlp` and `ffmpeg` available in your system `PATH` (`winget install yt-dlp.yt-dlp Gyan.FFmpeg`)
           files: |
             target/release/5KD.exe
           draft: false
