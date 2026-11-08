@@ -44,19 +44,27 @@ winget install Gyan.FFmpeg
 
 ---
 
-## Building & Running
+## Building & Creating a Release `.exe`
 
-Clone the repository and build the optimized native release binary with Cargo:
+### Option 1: One-Click Local Release Build (Windows)
+Double-click **`build_release.bat`** (or run it from a terminal):
+```bat
+.\build_release.bat
+```
+This compiles `5KD.exe` with full LTO + symbol stripping (`[profile.release]`), embeds the `#00e701` pixel-art `5` icon into the executable via `build.rs`, places the standalone binary at **`release\5KD.exe`**, and opens the `release\` folder in Explorer.
 
+### Option 2: Standard Cargo Build
 ```bash
 # Run directly in release mode
 cargo run --release
 
-# Or build the standalone executable
+# Or build the standalone executable at target/release/5KD.exe
 cargo build --release
 ```
 
-On Windows, `build.rs` automatically generates and embeds the custom `#00e701` pixel-art `5` application icon into the compiled `.exe` binary at `target/release/five_kd.exe`.
+### Option 3: Automated GitHub Releases (`.github/workflows/release.yml`)
+When pushed to GitHub:
+- Pushing a version tag (e.g., `git tag v1.0.0 && git push origin v1.0.0`) or clicking **Run workflow** in the **Actions** tab automatically compiles `5KD.exe` on `windows-latest` and publishes a GitHub Release with `5KD.exe` attached.
 
 ---
 

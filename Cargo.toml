@@ -4,6 +4,10 @@ version = "1.0.0"
 edition = "2021"
 description = "5KD - 5wi's Kick Downloader (Native Rust GUI with Integrated VOD Extractor)"
 
+[[bin]]
+name = "5KD"
+path = "src/main.rs"
+
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
@@ -15,3 +19,10 @@ chrono = "0.4"
 
 [build-dependencies]
 winres = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
