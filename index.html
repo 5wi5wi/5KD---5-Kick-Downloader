@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>5KD - 5wi's Kick Downloader</title>
+    <meta name="description" content="Fast Kick.com VOD & clip downloader written in Rust with custom time slicing, integrated VOD extractor, live terminal logging, and yt-dlp/ffmpeg engine." />
+    <meta property="og:title" content="5KD - 5wi's Kick Downloader" />
+    <meta property="og:description" content="Fast Kick.com VOD & clip downloader written in Rust with custom time slicing, integrated VOD extractor, live terminal logging, and yt-dlp/ffmpeg engine." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" type="image/png" href="/assets/aistudio/Gemini_Generated_Image_z2ceqoz2ceqoz2ce__1__ef8ae8c7.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --accent-green: #00e701;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+        background-color: #000000;
+        color: #ffffff;
+        height: 100vh;
+        width: 100vw;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        user-select: none;
+      }
+      .mono { font-family: 'JetBrains Mono', monospace; }
+      .topbar {
+        height: 40px;
+        background: #0c0c0c;
+        border-bottom: 1px solid #1f1f1f;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 14px;
+        font-size: 13px;
+        font-weight: 700;
+        flex-shrink: 0;
+      }
+      .app-icon {
+        border-radius: 4px;
+        object-fit: contain;
+        background: #000000;
+        border: 1px solid transparent;
+        transition: border-color 0.15s ease;
+      }
+      .app-icon:hover {
+        border-color: var(--accent-green);
+      }
+      .zoom-controls {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .zoom-btn {
+        background: #000000;
+        color: var(--accent-green);
+        border: 1px solid #2a2a2a;
+        border-radius: 5px;
+        width: 26px;
+        height: 24px;
+        font-size: 14px;
+        font-weight: 700;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s ease;
+      }
+      .zoom-btn:hover:not(:disabled) {
+        border-color: var(--accent-green);
+      }
+      .zoom-btn:disabled {
+        color: #555555;
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+      .workspace {
+        flex: 1;
+        display: flex;
+        overflow: hidden;
+        transform-origin: top left;
+      }
+      .sidebar {
+        width: 215px;
+        background: #000000;
+        border-right: 1px solid #262626;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        flex-shrink: 0;
+      }
+      .tab-icon {
+        width: 17px;
+        height: 17px;
+        object-fit: contain;
+        border-radius: 2px;
+        flex-shrink: 0;
+        display: block;
+      }
+      .nav-btn {
+        width: 100%;
+        text-align: left;
+        background: transparent;
+        color: #9ba0a5;
+        border: none;
+        border-left: 3px solid transparent;
+        padding: 10px 12px;
+        border-radius: 0 6px 6px 0;
+        font-size: 13.5px;
+        font-weight: 500;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 6px;
+        transition: all 0.15s ease;
+      }
+      .nav-btn:hover {
+        color: var(--accent-green);
+        background: rgba(0, 231, 1, 0.04);
+        border-left-color: var(--accent-green);
+      }
+      .nav-btn.active {
+        background: rgba(0, 231, 1, 0.08);
+        color: var(--accent-green);
+        border-left-color: var(--accent-green);
+        font-weight: 700;
+      }
+      .main {
+        flex: 1;
+        padding: 22px 24px;
+        overflow-y: auto;
+        background: #000000;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .url-bar {
+        background: #101010;
+        border: 1px solid #262626;
+        border-radius: 12px;
+        padding: 10px 10px 10px 16px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        transition: border-color 0.15s ease;
+      }
+      .url-bar:hover, .url-bar:focus-within {
+        border-color: var(--accent-green);
+      }
+      .url-input {
+        flex: 1;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: #ffffff;
+        font-size: 15px;
+      }
+      .btn-green {
+        background: #000000;
+        color: var(--accent-green);
+        border: 1.5px solid var(--accent-green);
+        font-weight: 700;
+        font-size: 13.5px;
+        padding: 10px 22px;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+      .btn-green:hover:not(:disabled) {
+        background: #0a140a;
+        border-color: var(--accent-green);
+      }
+      .btn-green:disabled {
+        color: #666666;
+        border-color: #2a2a2a;
+        cursor: not-allowed;
+        opacity: 0.6;
+      }
+      .controls-bar {
+        background: #1a1a1a;
+        border: 1px solid #2a2a2a;
+        border-radius: 12px;
+        padding: 12px 16px;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 18px;
+        font-size: 13px;
+        color: #9ba0a5;
+        transition: border-color 0.15s ease;
+      }
+      .controls-bar:hover {
+        border-color: var(--accent-green);
+      }
+      .ctrl-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .ctrl-input {
+        background: #101010;
+        border: 1px solid #333333;
+        color: #ffffff;
+        padding: 6px 10px;
+        border-radius: 7px;
+        font-size: 12.5px;
+        outline: none;
+        width: 135px;
+        transition: border-color 0.15s ease;
+      }
+      .ctrl-input:hover, .ctrl-input:focus {
+        border-color: var(--accent-green);
+      }
+      #output-path {
+        outline: none;
+      }
+      #output-path:hover, #output-path:focus {
+        border-color: #333333 !important;
+        outline: none !important;
+        box-shadow: none !important;
+      }
+      .res-dropdown {
+        position: relative;
+        width: 165px;
+      }
+      .res-trigger {
+        width: 100%;
+        background: #000000;
+        border: 1px solid #333333;
+        color: var(--accent-green);
+        padding: 6px 12px;
+        border-radius: 7px;
+        font-size: 12.5px;
+        font-weight: 700;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        transition: all 0.15s ease;
+      }
+      .res-trigger:hover, .res-trigger.open {
+        border-color: var(--accent-green);
+        background: #000000;
+      }
+      .res-menu {
+        display: none;
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 0;
+        width: 100%;
+        background: #000000;
+        border: 1.5px solid var(--accent-green);
+        border-radius: 8px;
+        padding: 5px;
+        z-index: 100;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.9);
+        flex-direction: column;
+        gap: 3px;
+      }
+      .res-menu.open {
+        display: flex;
+      }
+      .res-option {
+        background: #000000;
+        color: #9ba0a5;
+        border: 1px solid transparent;
+        padding: 7px 10px;
+        border-radius: 5px;
+        font-size: 12px;
+        font-weight: 600;
+        text-align: left;
+        cursor: pointer;
+        transition: all 0.12s ease;
+      }
+      .res-option:hover {
+        background: #000000;
+        color: var(--accent-green);
+        border-color: var(--accent-green);
+      }
+      .res-option.active {
+        background: #000000;
+        color: var(--accent-green);
+        border: 1px solid var(--accent-green);
+        font-weight: 700;
+      }
+      /* Container Extension & Action Buttons: Black background (#000000), Green text (#00e701) */
+      .ext-btn {
+        background: #000000;
+        color: #888888;
+        border: 1px solid #333333;
+        padding: 5px 10px;
+        border-radius: 5px;
+        font-size: 11.5px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: all 0.15s ease;
+      }
+      .ext-btn:hover {
+        background: #000000;
+        color: var(--accent-green);
+        border-color: var(--accent-green);
+      }
+      .ext-btn.active {
+        background: #000000;
+        color: var(--accent-green);
+        border: 1.5px solid var(--accent-green);
+        font-weight: 700;
+      }
+      .card {
+        background: #1a1a1a;
+        border: 1px solid #262626;
+        border-radius: 12px;
+        padding: 16px;
+        transition: border-color 0.15s ease;
+      }
+      .card:hover {
+        border-color: var(--accent-green);
+      }
+      .progress-track {
+        width: 100%;
+        height: 10px;
+        background: #101010;
+        border: 1px solid #2a2a2a;
+        border-radius: 99px;
+        overflow: hidden;
+        margin: 8px 0;
+      }
+      .progress-fill {
+        height: 100%;
+        background: var(--accent-green);
+        transition: width 0.25s ease;
+      }
+      .credit-link {
+        color: var(--accent-green);
+        background: #000000;
+        text-decoration: none;
+        border: 1px solid transparent;
+        padding: 2px 6px;
+        border-radius: 5px;
+        transition: border-color 0.15s ease;
+      }
+      .credit-link:hover {
+        border-color: var(--accent-green);
+        text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <img src="/assets/aistudio/Gemini_Generated_Image_z2ceqoz2ceqoz2ce__1__ef8ae8c7.png" alt="5KD Icon" width="22" height="22" class="app-icon" />
+        <span>5KD - 5wi's Kick Downloader</span>
+      </div>
+
+      <div class="zoom-controls">
+        <span style="font-size:11.5px;color:#9ba0a5;font-weight:500;">Zoom:</span>
+        <button id="zoom-out-btn" class="zoom-btn mono" onclick="changeZoom(-10)" title="Zoom Out" disabled>-</button>
+        <span id="zoom-label" class="mono" style="font-size:12px;color:var(--accent-green);min-width:40px;text-align:center;">100%</span>
+        <button id="zoom-in-btn" class="zoom-btn mono" onclick="changeZoom(10)" title="Zoom In">+</button>
+      </div>
+    </header>
+
+    <div id="workspace" class="workspace">
+      <aside class="sidebar">
+        <div>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+            <img src="/assets/aistudio/Gemini_Generated_Image_z2ceqoz2ceqoz2ce__1__ef8ae8c7.png" alt="5KD Icon" width="30" height="30" class="app-icon" />
+            <span style="font-size:20px;font-weight:800;">5KD</span>
+          </div>
+          <div style="font-size:11.5px;color:#9ba0a5;margin-bottom:24px;">5wi's Kick Downloader</div>
+
+          <button class="nav-btn active" onclick="switchTab('downloads', this)">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <img src="/assets/aistudio/Gemini_Generated_Image_y4ejqly4ejqly4ej__3__cd69388a.jpg" alt="Downloads" class="tab-icon" />
+              <span>Downloads</span>
+            </div>
+            <span id="badge-active" class="mono" style="font-size:11px;color:var(--accent-green);"></span>
+          </button>
+          <button class="nav-btn" onclick="switchTab('terminal', this)">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <img src="/assets/aistudio/Gemini_Generated_Image_y4ejqly4ejqly4ej__2__6838ff2c.jpg" alt="Terminal" class="tab-icon" />
+              <span>Terminal</span>
+            </div>
+          </button>
+          <button class="nav-btn" onclick="switchTab('completed', this)">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <img src="/assets/aistudio/Gemini_Generated_Image_y4ejqly4ejqly4ej__1__341e69e6.jpg" alt="Completed" class="tab-icon" />
+              <span>Completed</span>
+            </div>
+            <span id="badge-done" class="mono" style="font-size:11px;color:#9ba0a5;"></span>
+          </button>
+          <button class="nav-btn" onclick="switchTab('about', this)">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <img src="/assets/aistudio/Gemini_Generated_Image_y4ejqly4ejqly4ej_935f637b.jpg" alt="About" class="tab-icon" />
+              <span>About</span>
+            </div>
+          </button>
+        </div>
+
+        <div class="card" style="padding:12px;font-size:11px;color:#9ba0a5;background:#000000;border:1px solid #262626;">
+          <div style="display:flex;justify-content:space-between;">
+            <strong style="color:#fff;">Engine Mode</strong>
+            <span class="mono" style="color:var(--accent-green);">yt-dlp + ffmpeg</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div id="tab-downloads" style="display:flex;flex-direction:column;gap:14px;">
+          <form class="url-bar" onsubmit="startDownload(event)">
+            <input id="url-input" class="url-input" type="text" oninput="updateDownloadButtonState()" placeholder="Paste Kick VOD/Clip URL here..." />
+            <button type="submit" class="btn-green" id="dl-btn" disabled title="Choose an output folder below before downloading">Download</button>
+          </form>
+
+          <div class="controls-bar">
+            <div class="ctrl-group">
+              <span>Start Time (-ss):</span>
+              <input id="start-time" class="ctrl-input mono" type="text" placeholder="00:00:00 (Optional)" />
+            </div>
+            <div class="ctrl-group">
+              <span>End Time (-to):</span>
+              <input id="end-time" class="ctrl-input mono" type="text" placeholder="Optional (HH:MM:SS)" />
+            </div>
+            <div class="ctrl-group">
+              <span>Resolution:</span>
+              <div class="res-dropdown" id="res-dropdown">
+                <button type="button" id="resolution" class="res-trigger mono" value="1080p60" onclick="toggleResMenu(event)">
+                  <span id="res-selected-label">1080p60 (Source)</span>
+                  <span style="font-size:10px;color:var(--accent-green);">▼</span>
+                </button>
+                <div id="res-menu" class="res-menu mono">
+                  <button type="button" class="res-option active" onclick="selectRes('1080p60', '1080p60 (Source)', this)">1080p60 (Source)</button>
+                  <button type="button" class="res-option" onclick="selectRes('1080p', '1080p', this)">1080p</button>
+                  <button type="button" class="res-option" onclick="selectRes('720p60', '720p60', this)">720p60</button>
+                  <button type="button" class="res-option" onclick="selectRes('720p', '720p', this)">720p</button>
+                  <button type="button" class="res-option" onclick="selectRes('480p', '480p', this)">480p</button>
+                  <button type="button" class="res-option" onclick="selectRes('360p', '360p', this)">360p</button>
+                  <button type="button" class="res-option" onclick="selectRes('audio', 'Audio Only', this)">Audio Only</button>
+                </div>
+              </div>
+            </div>
+            <div class="ctrl-group">
+              <span>Container Extension:</span>
+              <div style="display:flex;gap:4px;">
+                <button type="button" class="ext-btn mono active" onclick="setExt('mkv', this)">.MKV</button>
+                <button type="button" class="ext-btn mono" onclick="setExt('mp4', this)">.MP4</button>
+                <button type="button" class="ext-btn mono" onclick="setExt('ts', this)">.TS</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="controls-bar" style="background:#141414;justify-content:space-between;">
+            <div class="ctrl-group" style="flex:1;">
+              <span>Output Folder (-o):</span>
+              <input id="output-path" class="ctrl-input mono" style="flex:1;width:auto;" type="text" readonly placeholder="Required: Click 'Choose Folder' to enable downloading..." />
+            </div>
+            <button type="button" id="choose-folder-btn" class="ext-btn" style="color:var(--accent-green);border-color:var(--accent-green);padding:7px 14px;" onclick="chooseFolder()">Choose Folder</button>
+          </div>
+
+          <h3 style="font-size:15.5px;margin-top:6px;">Download Queue / Active</h3>
+          <div id="active-list" class="card" style="color:#9ba0a5;font-size:13.5px;">
+            No active downloads. Choose an output folder first, then paste any Kick VOD URL to download.
+          </div>
+
+          <h3 style="font-size:15.5px;margin-top:6px;">Recent Downloads</h3>
+          <div id="recent-list" class="card" style="color:#9ba0a5;font-size:13.5px;">
+            No completed downloads yet.
+          </div>
+        </div>
+
+        <div id="tab-terminal" style="display:none;flex-direction:column;gap:12px;height:100%;">
+          <h3 style="font-size:17px;">Live Terminal Output</h3>
+          <div id="term-box" class="card mono" style="flex:1;background:#101010;overflow-y:auto;font-size:12px;line-height:1.6;color:#c8cdd2;">
+            <div>[info] 5KD - 5wi's Kick Downloader (Native Rust Engine) initialized.</div>
+            <div>[info] Integrated Kick VOD Extractor ready.</div>
+          </div>
+        </div>
+
+        <div id="tab-completed" style="display:none;flex-direction:column;gap:12px;">
+          <h3 style="font-size:17px;">Completed Downloads</h3>
+          <div id="completed-list" class="card" style="color:#9ba0a5;font-size:13.5px;">
+            No completed downloads yet.
+          </div>
+        </div>
+
+        <div id="tab-about" style="display:none;flex-direction:column;gap:14px;">
+          <div style="display:flex;align-items:center;gap:12px;padding-bottom:12px;border-bottom:1px solid #1f1f1f;">
+            <img src="/assets/aistudio/Gemini_Generated_Image_z2ceqoz2ceqoz2ce__1__ef8ae8c7.png" alt="5KD Icon" width="38" height="38" class="app-icon" />
+            <div>
+              <h3 style="font-size:19px;font-weight:700;">5KD - 5wi's Kick Downloader</h3>
+              <p style="font-size:13px;color:#9ba0a5;">High-performance Kick.com VOD &amp; clip downloader written in Rust.</p>
+            </div>
+          </div>
+
+          <div class="card" style="color:#9ba0a5;font-size:13px;line-height:1.6;">
+            <strong style="color:#ffffff;font-size:14.5px;">Architecture &amp; Engine</strong><br/>
+            Built natively in Rust using <code class="mono">eframe/egui</code>, <code class="mono">reqwest</code>, <code class="mono">rfd</code>, <code class="mono">yt-dlp</code>, and <code class="mono">ffmpeg</code>.
+          </div>
+
+          <div class="card" style="color:#9ba0a5;font-size:13px;line-height:1.6;">
+            <strong style="color:#ffffff;font-size:14.5px;">Credits &amp; Acknowledgments</strong><br/>
+            M3U8 URL Extractor powered by <strong>kickvod-extractor</strong>:<br/>
+            <a href="https://github.com/mortyobnoxious/kickvod-extractor" target="_blank" rel="noopener noreferrer" class="credit-link mono">
+              https://github.com/mortyobnoxious/kickvod-extractor
+            </a>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script>
+      let currentExt = 'mkv';
+      let currentZoom = 100;
+      let activeTimer = null;
+      let activeCanceled = false;
+      let activeDownloadTitle = '';
+
+      function updateDownloadButtonState() {
+        const hasFolder = document.getElementById('output-path').value.trim().length > 0;
+        const hasUrl = document.getElementById('url-input').value.trim().length > 0;
+        const dlBtn = document.getElementById('dl-btn');
+        dlBtn.disabled = !(hasFolder && hasUrl);
+        dlBtn.title = hasFolder ? "Start Download" : "Choose an output folder below before downloading";
+      }
+
+      function changeZoom(delta) {
+        currentZoom = Math.min(150, Math.max(100, currentZoom + delta));
+        document.getElementById('zoom-label').textContent = currentZoom + '%';
+        document.getElementById('zoom-out-btn').disabled = (currentZoom <= 100);
+        document.getElementById('zoom-in-btn').disabled = (currentZoom >= 150);
+        const ws = document.getElementById('workspace');
+        ws.style.zoom = (currentZoom / 100);
+      }
+
+      function setExt(ext, btn) {
+        currentExt = ext;
+        document.querySelectorAll('.ext-btn').forEach(b => {
+          if (b.textContent.startsWith('.')) b.classList.remove('active');
+        });
+        btn.classList.add('active');
+      }
+      function toggleResMenu(e) {
+        e.stopPropagation();
+        const menu = document.getElementById('res-menu');
+        const trigger = document.getElementById('resolution');
+        const isOpen = menu.classList.toggle('open');
+        trigger.classList.toggle('open', isOpen);
+      }
+      function selectRes(val, label, btn) {
+        const trigger = document.getElementById('resolution');
+        trigger.value = val;
+        document.getElementById('res-selected-label').textContent = label;
+        document.querySelectorAll('.res-option').forEach(o => o.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('res-menu').classList.remove('open');
+        trigger.classList.remove('open');
+      }
+      document.addEventListener('click', (e) => {
+        const dd = document.getElementById('res-dropdown');
+        if (dd && !dd.contains(e.target)) {
+          const menu = document.getElementById('res-menu');
+          const trigger = document.getElementById('resolution');
+          if (menu) menu.classList.remove('open');
+          if (trigger) trigger.classList.remove('open');
+        }
+      });
+      function switchTab(tab, btn) {
+        ['downloads', 'terminal', 'completed', 'about'].forEach(t => {
+          document.getElementById('tab-' + t).style.display = (t === tab) ? 'flex' : 'none';
+        });
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      }
+      async function chooseFolder() {
+        let chosen = false;
+        if ('showDirectoryPicker' in window) {
+          try {
+            const dir = await window.showDirectoryPicker();
+            if (dir && dir.name) {
+              document.getElementById('output-path').value = 'C:\\Users\\azizm\\' + dir.name;
+              chosen = true;
+            }
+          } catch (_) {}
+        }
+        if (!chosen) {
+          document.getElementById('output-path').value = 'C:\\Users\\azizm\\Desktop';
+        }
+        updateDownloadButtonState();
+        const activeList = document.getElementById('active-list');
+        if (!activeTimer && activeList.textContent.includes('Choose an output folder')) {
+          activeList.textContent = 'No active downloads. Paste any Kick VOD URL above to automatically extract & download.';
+        }
+      }
+      function logLine(msg) {
+        const box = document.getElementById('term-box');
+        const d = document.createElement('div');
+        d.textContent = msg;
+        box.appendChild(d);
+        box.scrollTop = box.scrollHeight;
+      }
+      const AWS_ID = "196233775518";
+      const VIDDASTRAGE_PROXY = "https://cors.viddastrage.workers.dev/corsproxy/?apiurl=";
+
+      async function getKickJSON(targetUrl) {
+        const candidates = [
+          VIDDASTRAGE_PROXY + encodeURIComponent(targetUrl),
+          targetUrl
+        ];
+        for (const u of candidates) {
+          try {
+            const r = await fetch(u);
+            if (!r.ok) continue;
+            const j = await r.json();
+            if (j && !j.error && !(j.message && j.message.includes("No query results"))) {
+              return j;
+            }
+          } catch (_) {}
+        }
+        throw new Error("Could not fetch Kick API metadata");
+      }
+
+      async function extractKickVodReal(rawUrl) {
+        const m = rawUrl.match(/kick\.com\/([^\/]+)\/videos\/([a-f0-9-]+)/i);
+        if (!m) return { m3u8: rawUrl, title: rawUrl, sourceType: "Direct URL" };
+        const user = m[1], uuid = m[2];
+        let vod = null, v2Match = null;
+        try {
+          vod = await getKickJSON(`https://kick.com/api/v1/video/${uuid}`);
+        } catch (_) {
+          logLine(`[extractor] Querying v2 channel videos for '${user}' (UUIDv7 lookup)...`);
+          const v2Videos = await getKickJSON(`https://kick.com/api/v2/channels/${user}/videos`);
+          const hexTs = uuid.replace(/-/g, '').substring(0, 12);
+          const uuidTime = parseInt(hexTs, 16);
+          v2Match = v2Videos.find(v => {
+            if (v.vod_id === uuid || v.video?.uuid === uuid) return true;
+            const rawDate = v.video?.created_at || v.created_at || v.start_time || '';
+            const normDate = rawDate.includes('T') ? rawDate : rawDate.replace(' ', 'T') + 'Z';
+            const videoTime = new Date(normDate).getTime();
+            return Math.abs(videoTime - uuidTime) < 30000;
+          });
+          if (v2Match?.video?.uuid) {
+            try {
+              vod = await getKickJSON(`https://kick.com/api/v1/video/${v2Match.video.uuid}`);
+            } catch (_) {}
+          }
+        }
+        const activeVod = vod || v2Match;
+        if (!activeVod) throw new Error("VOD not found in Kick database");
+        const ls = activeVod.livestream || v2Match;
+        const title = ls?.session_title || activeVod.session_title || `${user} VOD`;
+        const src = activeVod.source || v2Match?.source;
+        if (src) {
+          return { m3u8: src, title: `${user} - ${title}`, sourceType: "Source URL from API" };
+        }
+        throw new Error("No direct source found");
+      }
+
+      function cancelOngoingDownload() {
+        activeCanceled = true;
+        if (activeTimer) {
+          clearInterval(activeTimer);
+          activeTimer = null;
+        }
+        logLine('[cancel] Download canceled by user: ' + activeDownloadTitle);
+        const activeList = document.getElementById('active-list');
+        activeList.innerHTML = 'No active downloads. Paste any Kick VOD URL above to automatically extract & download.';
+        const canceledHtml = '<div style="color:#fff;font-weight:600;">' + activeDownloadTitle + ' <span class="mono" style="color:#ff6b6b;font-size:12px;margin-left:8px;">[Canceled by user]</span></div>';
+        document.getElementById('recent-list').innerHTML = canceledHtml;
+      }
+
+      async function startDownload(e) {
+        e.preventDefault();
+        const folder = document.getElementById('output-path').value.trim();
+        const url = document.getElementById('url-input').value.trim();
+        if (!url || !folder) return;
+
+        activeCanceled = false;
+        activeDownloadTitle = url;
+        document.getElementById('url-input').value = '';
+        updateDownloadButtonState();
+
+        logLine('[extractor] Analyzing URL: ' + url);
+        const activeList = document.getElementById('active-list');
+        activeList.innerHTML =
+          '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">' +
+            '<div id="dl-title" style="color:#fff;font-weight:700;">Extracting VOD: ' + url + '</div>' +
+            '<button type="button" class="ext-btn mono" style="color:var(--accent-green);border-color:var(--accent-green);padding:6px 14px;" onclick="cancelOngoingDownload()">Cancel</button>' +
+          '</div>' +
+          '<div class="progress-track"><div id="prog-bar" class="progress-fill" style="width:5%"></div></div>' +
+          '<div id="prog-txt" class="mono" style="font-size:11.5px;color:#9ba0a5;">Extracting Master M3U8 URL from Kick...</div>';
+
+        let meta = { m3u8: url, title: url, sourceType: "Direct" };
+        try {
+          meta = await extractKickVodReal(url);
+          if (activeCanceled) return;
+          logLine(`[extractor] Extracted Master M3U8 (${meta.sourceType}): ${meta.m3u8}`);
+        } catch (err) {
+          if (activeCanceled) return;
+          logLine(`[extractor error] ${err.message}`);
+        }
+
+        if (activeCanceled) return;
+        activeDownloadTitle = meta.title;
+        const titleEl = document.getElementById('dl-title');
+        if (titleEl) titleEl.textContent = meta.title;
+
+        let pct = 10;
+        activeTimer = setInterval(() => {
+          if (activeCanceled) {
+            clearInterval(activeTimer);
+            activeTimer = null;
+            return;
+          }
+          pct += 18;
+          const bar = document.getElementById('prog-bar');
+          const txt = document.getElementById('prog-txt');
+          if (bar) bar.style.width = Math.min(pct, 100) + '%';
+          if (txt) txt.textContent = 'Downloading via yt-dlp + ffmpeg (' + Math.min(pct, 100) + '%) -> ' + meta.m3u8;
+          if (pct >= 100) {
+            clearInterval(activeTimer);
+            activeTimer = null;
+            activeList.innerHTML = 'No active downloads. Paste any Kick VOD URL above to automatically extract & download.';
+            const doneHtml = '<div style="color:#fff;font-weight:600;">' + meta.title + ' <span class="mono" style="color:var(--accent-green);font-size:12px;margin-left:8px;">[Completed .' + currentExt.toUpperCase() + ']</span><div class="mono" style="font-size:11px;color:#9ba0a5;margin-top:4px;">' + meta.m3u8 + '</div></div>';
+            document.getElementById('recent-list').innerHTML = doneHtml;
+            document.getElementById('completed-list').innerHTML = doneHtml;
+            logLine('[download] 100% Completed: ' + meta.title);
+          }
+        }, 400);
+      }
+    </script>
+  </body>
+</html>

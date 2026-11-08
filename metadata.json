@@ -1,0 +1,8 @@
+{
+  "name": "5KD - 5wi's Kick Downloader",
+  "description": "Fast Kick.com VOD & clip downloader with custom time slicing, integrated VOD extractor, live terminal logging, and yt-dlp/ffmpeg engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
