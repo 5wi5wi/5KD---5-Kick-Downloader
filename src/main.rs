@@ -4,12 +4,17 @@ use chrono::{DateTime, Datelike, NaiveDateTime, Timelike};
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Rounding, Stroke, Vec2};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const AWS_ID: &str = "196233775518";
 const VIDDASTRAGE_PROXY: &str = "https://cors.viddastrage.workers.dev/corsproxy/?apiurl=";
@@ -37,6 +42,108 @@ const ICON_5_GRID: [&str; 18] = [
     "..############..",
     "..############..",
 ];
+
+// Pixel art grids matching the 4 uploaded tab icons in /public/assets/aistudio/
+const ICON_DOWNLOADS_GRID: [&str; 22] = [
+    "......................",
+    "......................",
+    "......................",
+    "........######........",
+    "......................",
+    "........######........",
+    "........######........",
+    "........######........",
+    "........######........",
+    ".....############.....",
+    "......##########......",
+    ".......########.......",
+    "........######........",
+    ".........####.........",
+    "...##.....##.....##...",
+    "...##............##...",
+    "...################...",
+    "....##############....",
+    "......................",
+    "......................",
+    "......................",
+    "......................",
+];
+
+const ICON_TERMINAL_GRID: [&str; 22] = [
+    "......................",
+    "......................",
+    "......................",
+    "....##############....",
+    "...################...",
+    "...##............##...",
+    "...##.##.........##...",
+    "...##.###........##...",
+    "...##..###.......##...",
+    "...##...###......##...",
+    "...##....##......##...",
+    "...##...###......##...",
+    "...##..###.......##...",
+    "...##.###........##...",
+    "...##.##...#####.##...",
+    "...##......#####.##...",
+    "...##............##...",
+    "...################...",
+    "....##############....",
+    "......................",
+    "......................",
+    "......................",
+];
+
+const ICON_COMPLETED_GRID: [&str; 22] = [
+    "......................",
+    "......................",
+    "......................",
+    "........######........",
+    ".....####....####.....",
+    "....###........###....",
+    "...##............##...",
+    "...##.........##.##...",
+    "..##.........####.##..",
+    "..##........####..##..",
+    "..##..###..####...##..",
+    "..##..########....##..",
+    "..##...######.....##..",
+    "...##...####.....##...",
+    "...##....##......##...",
+    "....###........###....",
+    ".....####....####.....",
+    "........######........",
+    "......................",
+    "......................",
+    "......................",
+    "......................",
+];
+
+const ICON_ABOUT_GRID: [&str; 22] = [
+    "......................",
+    "......................",
+    "........######........",
+    "......##########......",
+    ".....###......###.....",
+    "....##..........##....",
+    "...##.....##.....##...",
+    "...##.....##.....##...",
+    "..##..............##..",
+    "..##.....###......##..",
+    "..##......##......##..",
+    "..##......##......##..",
+    "..##......##......##..",
+    "..###.....##.....###..",
+    "...##....####....##...",
+    "....##...####...##....",
+    ".....###......###.....",
+    "......##########......",
+    "........######........",
+    "......................",
+    "......................",
+    "......................",
+];
+
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -561,6 +668,35 @@ fn draw_pixel_5_icon(ui: &mut egui::Ui, size: f32, accent_green: Color32) {
     }
 }
 
+fn draw_tab_icon(ui: &mut egui::Ui, tab: Tab, size: f32, accent_green: Color32) {
+    let grid: &[&str; 22] = match tab {
+        Tab::Downloads => &ICON_DOWNLOADS_GRID,
+        Tab::Terminal => &ICON_TERMINAL_GRID,
+        Tab::Completed => &ICON_COMPLETED_GRID,
+        Tab::About => &ICON_ABOUT_GRID,
+    };
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(size, size), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 3.0, Color32::BLACK);
+    let cell_w = rect.width() / 22.0;
+    let cell_h = rect.height() / 22.0;
+    for (r, row) in grid.iter().enumerate() {
+        for (c, ch) in row.chars().enumerate() {
+            if ch == '#' {
+                let px = rect.min.x + (c as f32) * cell_w;
+                let py = rect.min.y + (r as f32) * cell_h;
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(px, py),
+                        Vec2::new(cell_w.ceil(), cell_h.ceil()),
+                    ),
+                    0.0,
+                    accent_green,
+                );
+            }
+        }
+    }
+}
+
 struct FiveKdApp {
     current_tab: Tab,
     zoom_percent: u32, // 100 to 150
@@ -650,6 +786,8 @@ impl FiveKdApp {
                     {
                         let _ = Command::new("taskkill")
                             .args(["/F", "/T", "/PID", &pid.to_string()])
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .spawn();
@@ -789,8 +927,12 @@ impl FiveKdApp {
             cmd.arg("-o")
                 .arg(&final_output)
                 .arg(&extracted.m3u8_url)
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(CREATE_NO_WINDOW);
 
             let _ = tx.send(WorkerEvent::Log(format!(
                 ">>> Executing yt-dlp -> {}",
@@ -1050,13 +1192,13 @@ impl eframe::App for FiveKdApp {
                     ui.add_space(20.0);
 
                     let nav_items = [
-                        (Tab::Downloads, "Downloads", self.active_downloads.len(), "📥"),
-                        (Tab::Terminal, "Terminal", self.terminal_logs.len(), ">_"),
-                        (Tab::Completed, "Completed", self.completed_downloads.len(), "✓"),
-                        (Tab::About, "About", 0, "ℹ"),
+                        (Tab::Downloads, "Downloads", self.active_downloads.len()),
+                        (Tab::Terminal, "Terminal", self.terminal_logs.len()),
+                        (Tab::Completed, "Completed", self.completed_downloads.len()),
+                        (Tab::About, "About", 0),
                     ];
 
-                    for (tab, label, count, icon) in nav_items {
+                    for (tab, label, count) in nav_items {
                         let is_selected = self.current_tab == tab;
                         let fg = if is_selected {
                             accent_green
@@ -1064,24 +1206,29 @@ impl eframe::App for FiveKdApp {
                             muted_text
                         };
 
+                        // Subtle dark-green tint (#001402) when selected, matching rgba(0, 231, 1, 0.08) over black
+                        let bg_fill = if is_selected {
+                            Color32::from_rgb(0, 20, 2)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+
                         let btn_res = egui::Frame::none()
-                            .fill(if is_selected {
-                                Color32::from_rgba_premultiplied(0, 231, 1, 12)
-                            } else {
-                                Color32::TRANSPARENT
+                            .fill(bg_fill)
+                            .rounding(Rounding {
+                                nw: 0.0,
+                                sw: 0.0,
+                                ne: 6.0,
+                                se: 6.0,
                             })
-                            .rounding(Rounding { nw: 0.0, sw: 0.0, ne: 6.0, se: 6.0 })
                             .inner_margin(egui::Margin::symmetric(12.0, 9.0))
                             .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(icon)
-                                            .size(13.0)
-                                            .color(fg)
-                                            .family(FontFamily::Monospace),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(RichText::new(label).size(13.5).color(fg).strong());
+                                    draw_tab_icon(ui, tab, 20.0, accent_green);
+                                    ui.add_space(8.0);
+                                    let text = RichText::new(label).size(13.5).color(fg);
+                                    ui.label(if is_selected { text.strong() } else { text });
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
@@ -1099,7 +1246,11 @@ impl eframe::App for FiveKdApp {
                             });
 
                         let interact = btn_res.response.interact(egui::Sense::click());
-                        // Use a line instead for the active/hovered tab indicator
+                        if interact.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+
+                        // Left vertical #00e701 line indicator for active/hovered tab
                         if is_selected {
                             ui.painter().vline(
                                 btn_res.response.rect.left(),
