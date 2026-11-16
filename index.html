@@ -615,6 +615,7 @@
       async function getKickJSON(targetUrl) {
         const candidates = [
           VIDDASTRAGE_PROXY + encodeURIComponent(targetUrl),
+          "https://api.cors.lol/?url=" + encodeURIComponent(targetUrl),
           targetUrl
         ];
         for (const u of candidates) {
@@ -639,17 +640,24 @@
           vod = await getKickJSON(`https://kick.com/api/v1/video/${uuid}`);
         } catch (_) {
           logLine(`[extractor] Querying v2 channel videos for '${user}' (UUIDv7 lookup)...`);
-          const v2Videos = await getKickJSON(`https://kick.com/api/v2/channels/${user}/videos`);
+          let videoList = [];
+          try {
+            const v2Videos = await getKickJSON(`https://kick.com/api/v2/channels/${user}/videos`);
+            if (Array.isArray(v2Videos)) videoList = v2Videos;
+          } catch (_) {
+            const v1Ch = await getKickJSON(`https://kick.com/api/v1/channels/${user}`);
+            if (Array.isArray(v1Ch?.previous_livestreams)) videoList = v1Ch.previous_livestreams;
+          }
           const hexTs = uuid.replace(/-/g, '').substring(0, 12);
           const uuidTime = parseInt(hexTs, 16);
-          v2Match = v2Videos.find(v => {
+          v2Match = videoList.find(v => {
             if (v.vod_id === uuid || v.video?.uuid === uuid) return true;
             const rawDate = v.video?.created_at || v.created_at || v.start_time || '';
             const normDate = rawDate.includes('T') ? rawDate : rawDate.replace(' ', 'T') + 'Z';
             const videoTime = new Date(normDate).getTime();
             return Math.abs(videoTime - uuidTime) < 30000;
           });
-          if (v2Match?.video?.uuid) {
+          if (v2Match && !v2Match.source && v2Match.video?.uuid) {
             try {
               vod = await getKickJSON(`https://kick.com/api/v1/video/${v2Match.video.uuid}`);
             } catch (_) {}

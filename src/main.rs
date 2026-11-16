@@ -288,18 +288,61 @@ fn is_valid_kick_payload(val: &Value) -> bool {
     }
 }
 
-fn get_kick_json(client: &reqwest::blocking::Client, target_url: &str) -> Result<Value, String> {
+const CORS_LOL_PROXY: &str = "https://api.cors.lol/?url=";
+const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+fn curl_fetch_text(url: &str) -> Option<String> {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-sS",
+        "-L",
+        "--max-time",
+        "12",
+        "-H",
+        "Accept: application/json",
+        "-A",
+        CHROME_UA,
+        url,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn get_kick_json(
+    client: &reqwest::blocking::Client,
+    target_url: &str,
+    tx: Option<&Sender<WorkerEvent>>,
+) -> Result<Value, String> {
     let candidates = [
-        format!("{}{}", VIDDASTRAGE_PROXY, encode_uri_component(target_url)),
-        target_url.to_string(),
-        format!(
-            "https://api.allorigins.win/raw?url={}",
-            encode_uri_component(target_url)
+        (
+            "viddastrage",
+            format!("{}{}", VIDDASTRAGE_PROXY, encode_uri_component(target_url)),
         ),
+        (
+            "cors.lol",
+            format!("{}{}", CORS_LOL_PROXY, encode_uri_component(target_url)),
+        ),
+        ("direct", target_url.to_string()),
     ];
 
-    let mut last_err = String::from("No response from Kick API");
-    for candidate in &candidates {
+    let mut errors: Vec<String> = Vec::new();
+
+    for (label, candidate) in &candidates {
         match client
             .get(candidate)
             .header("Accept", "application/json")
@@ -308,23 +351,56 @@ fn get_kick_json(client: &reqwest::blocking::Client, target_url: &str) -> Result
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    if let Ok(val) = resp.json::<Value>() {
-                        if is_valid_kick_payload(&val) {
-                            return Ok(val);
-                        } else {
-                            last_err = format!("API returned error object for {}", target_url);
+                    match resp.text() {
+                        Ok(body) => match serde_json::from_str::<Value>(&body) {
+                            Ok(val) => {
+                                if is_valid_kick_payload(&val) {
+                                    return Ok(val);
+                                } else {
+                                    errors.push(format!("{}: API error payload", label));
+                                }
+                            }
+                            Err(_) => {
+                                errors.push(format!("{}: non-JSON response", label));
+                            }
+                        },
+                        Err(e) => {
+                            errors.push(format!("{}: read error ({})", label, e));
                         }
                     }
                 } else {
-                    last_err = format!("HTTP {} from {}", status.as_u16(), target_url);
+                    errors.push(format!("{}: HTTP {}", label, status.as_u16()));
                 }
             }
             Err(e) => {
-                last_err = e.to_string();
+                errors.push(format!("{}: {}", label, e));
             }
         }
     }
-    Err(last_err)
+
+    // Fallback to native curl (preinstalled on Windows 10/11, macOS, Linux) if reqwest hits TLS/proxy issues
+    for (label, candidate) in &candidates {
+        if let Some(body) = curl_fetch_text(candidate) {
+            if let Ok(val) = serde_json::from_str::<Value>(&body) {
+                if is_valid_kick_payload(&val) {
+                    if let Some(sender) = tx {
+                        let _ = sender.send(WorkerEvent::Log(format!(
+                            "[extractor] Fetched metadata via curl ({})",
+                            label
+                        )));
+                    }
+                    return Ok(val);
+                }
+            }
+        }
+    }
+
+    let summary = if errors.is_empty() {
+        format!("No response from Kick API ({})", target_url)
+    } else {
+        errors.join(" | ")
+    };
+    Err(summary)
 }
 
 fn test_m3u8_url(client: &reqwest::blocking::Client, m3u8_url: &str) -> bool {
@@ -340,6 +416,11 @@ fn test_m3u8_url(client: &reqwest::blocking::Client, m3u8_url: &str) -> bool {
     let proxied = format!("{}{}", VIDDASTRAGE_PROXY, encode_uri_component(m3u8_url));
     if let Ok(resp) = client.head(&proxied).send() {
         if resp.status().is_success() {
+            return true;
+        }
+    }
+    if let Some(body) = curl_fetch_text(m3u8_url) {
+        if body.contains("#EXTM3U") {
             return true;
         }
     }
@@ -388,6 +469,74 @@ fn extract_thumb_ids(thumb: &str) -> Option<(String, String)> {
     None
 }
 
+fn ytdlp_extract_kick_fallback(
+    raw_url: &str,
+    tx: &Sender<WorkerEvent>,
+) -> Option<ExtractedVodMeta> {
+    let _ = tx.send(WorkerEvent::Log(
+        "[extractor] Trying yt-dlp metadata extraction fallback...".to_string(),
+    ));
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
+        "--dump-single-json",
+        "--no-warnings",
+        "--no-playlist",
+        raw_url,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let m3u8_url = val
+        .get("manifest_url")
+        .and_then(|s| s.as_str())
+        .or_else(|| val.get("url").and_then(|s| s.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if m3u8_url.is_empty() {
+        return None;
+    }
+
+    let channel_slug = val
+        .get("channel")
+        .or_else(|| val.get("uploader"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("kick_vod")
+        .to_string();
+    let session_title = val
+        .get("title")
+        .and_then(|s| s.as_str())
+        .unwrap_or("Kick VOD")
+        .to_string();
+    let duration_secs = val.get("duration").and_then(|d| d.as_u64()).unwrap_or(0);
+    let duration_formatted = if duration_secs > 0 {
+        format!(
+            "{:02}:{:02}:{:02}",
+            duration_secs / 3600,
+            (duration_secs % 3600) / 60,
+            duration_secs % 60
+        )
+    } else {
+        "Full VOD".to_string()
+    };
+
+    Some(ExtractedVodMeta {
+        m3u8_url,
+        channel_slug,
+        session_title,
+        duration_formatted,
+        source_type: "yt-dlp fallback".to_string(),
+    })
+}
+
 /// Extracts Master M3U8 and metadata from a Kick VOD URL
 /// Full port of https://github.com/mortyobnoxious/kickvod-extractor
 fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<ExtractedVodMeta, String> {
@@ -425,33 +574,63 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
     }
 
     if uuid.is_empty() {
-        return Err("Invalid Kick VOD URL (expected https://kick.com/{channel}/videos/{uuid})".to_string());
+        if let Some(meta) = ytdlp_extract_kick_fallback(trimmed, tx) {
+            return Ok(meta);
+        }
+        return Err(
+            "Invalid Kick VOD URL (expected https://kick.com/{channel}/videos/{uuid})".to_string(),
+        );
     }
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        .timeout(Duration::from_secs(15))
+        .user_agent(CHROME_UA)
+        .timeout(Duration::from_secs(12))
         .build()
         .map_err(|e| e.to_string())?;
 
-    // 1. Try v1/video/{uuid} first, then fallback to v2/channels/{user}/videos with UUIDv7 timestamp matching
+    // 1. Try v1/video/{uuid} first, then fallback to v2/channels/{user}/videos and v1/channels/{user}
     let v1_url = format!("https://kick.com/api/v1/video/{}", uuid);
-    let mut vod_obj: Option<Value> = get_kick_json(&client, &v1_url).ok();
+    let mut vod_obj: Option<Value> = get_kick_json(&client, &v1_url, None).ok();
     let mut v2_matched_obj: Option<Value> = None;
+    let mut api_err_opt: Option<String> = None;
 
     if vod_obj.is_none() && !user.is_empty() {
         let _ = tx.send(WorkerEvent::Log(format!(
             "[extractor] Querying v2 channel videos for '{}' (UUIDv7 lookup)...",
             user
         )));
-        let v2_url = format!("https://kick.com/api/v2/channels/{}/videos", user);
-        let v2_videos = get_kick_json(&client, &v2_url)?;
 
-        if let Some(arr) = v2_videos.as_array() {
+        let mut video_items: Vec<Value> = Vec::new();
+        let v2_url = format!("https://kick.com/api/v2/channels/{}/videos", user);
+        match get_kick_json(&client, &v2_url, Some(tx)) {
+            Ok(v2_val) => {
+                if let Some(arr) = v2_val.as_array() {
+                    video_items = arr.clone();
+                }
+            }
+            Err(e) => {
+                api_err_opt = Some(e);
+                let _ = tx.send(WorkerEvent::Log(format!(
+                    "[extractor] v2 lookup failed, trying v1 channel endpoint for '{}'...",
+                    user
+                )));
+                let v1_ch_url = format!("https://kick.com/api/v1/channels/{}", user);
+                if let Ok(ch_val) = get_kick_json(&client, &v1_ch_url, Some(tx)) {
+                    if let Some(arr) = ch_val
+                        .get("previous_livestreams")
+                        .and_then(|p| p.as_array())
+                    {
+                        video_items = arr.clone();
+                    }
+                }
+            }
+        }
+
+        if !video_items.is_empty() {
             let hex_ts: String = uuid.chars().filter(|c| *c != '-').take(12).collect();
             let uuid_time_ms = i64::from_str_radix(&hex_ts, 16).unwrap_or(0);
 
-            for v in arr {
+            for v in &video_items {
                 let vod_id_match = v.get("vod_id").and_then(|s| s.as_str()) == Some(&uuid);
                 let video_uuid_match = v
                     .get("video")
@@ -479,14 +658,21 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
 
                 if vod_id_match || video_uuid_match || time_match {
                     v2_matched_obj = Some(v.clone());
-                    if let Some(inner_uuid) = v
-                        .get("video")
-                        .and_then(|vid| vid.get("uuid"))
+                    let has_source = v
+                        .get("source")
                         .and_then(|s| s.as_str())
-                    {
-                        let inner_v1 = format!("https://kick.com/api/v1/video/{}", inner_uuid);
-                        if let Ok(v1_res) = get_kick_json(&client, &inner_v1) {
-                            vod_obj = Some(v1_res);
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if !has_source {
+                        if let Some(inner_uuid) = v
+                            .get("video")
+                            .and_then(|vid| vid.get("uuid"))
+                            .and_then(|s| s.as_str())
+                        {
+                            let inner_v1 = format!("https://kick.com/api/v1/video/{}", inner_uuid);
+                            if let Ok(v1_res) = get_kick_json(&client, &inner_v1, None) {
+                                vod_obj = Some(v1_res);
+                            }
                         }
                     }
                     break;
@@ -495,10 +681,15 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
         }
     }
 
-    let vod = vod_obj
-        .as_ref()
-        .or(v2_matched_obj.as_ref())
-        .ok_or_else(|| "VOD not found in Kick database".to_string())?;
+    let vod = match vod_obj.as_ref().or(v2_matched_obj.as_ref()) {
+        Some(v) => v,
+        None => {
+            if let Some(meta) = ytdlp_extract_kick_fallback(trimmed, tx) {
+                return Ok(meta);
+            }
+            return Err(api_err_opt.unwrap_or_else(|| "VOD not found in Kick database".to_string()));
+        }
+    };
 
     let ls = vod.get("livestream").or(v2_matched_obj.as_ref());
 
@@ -617,7 +808,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
     let _ = tx.send(WorkerEvent::Log(
         "[extractor] Fetching CDN prefixes list from kickvod-extractor...".to_string(),
     ));
-    let prefixes_val = get_kick_json(&client, PREFIXES_URL)?;
+    let prefixes_val = get_kick_json(&client, PREFIXES_URL, Some(tx))?;
     if let Some(prefixes) = prefixes_val.as_array() {
         for prefix_val in prefixes {
             if let Some(prefix) = prefix_val.as_str() {
