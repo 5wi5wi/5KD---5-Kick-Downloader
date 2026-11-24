@@ -1,9 +1,14 @@
+#[cfg(windows)]
 use std::env;
+#[cfg(windows)]
 use std::fs::File;
+#[cfg(windows)]
 use std::io::Write;
+#[cfg(windows)]
 use std::path::PathBuf;
 
 // Exact 16x18 pixel grid matching /public/assets/aistudio/Gemini_Generated_Image_z2ceqoz2ceqoz2ce__1__ef8ae8c7.png
+#[cfg(windows)]
 const ICON_5_GRID: [&str; 18] = [
     "################",
     "################",
@@ -25,6 +30,7 @@ const ICON_5_GRID: [&str; 18] = [
     "..############..",
 ];
 
+#[cfg(windows)]
 fn generate_ico_bytes() -> Vec<u8> {
     let icon_size: u32 = 64;
     let bpp: u16 = 32;
