@@ -697,6 +697,115 @@ fn get_cached_prefixes(
     Ok(CACHED_PREFIXES.get().map(|v| v.as_slice()).unwrap_or(&[]))
 }
 
+/// Sanitizes a VOD or Clip title into a safe cross-platform filename stem.
+fn sanitize_filename(raw_title: &str, fallback: &str) -> String {
+    let mut cleaned = String::with_capacity(raw_title.len());
+    let mut last_was_space = false;
+
+    for ch in raw_title.chars() {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            if !last_was_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+                last_was_space = true;
+            }
+        } else if ch.is_whitespace() {
+            if !last_was_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            cleaned.push(ch);
+            last_was_space = false;
+        }
+    }
+
+    let trimmed = cleaned.trim_matches(|c: char| c.is_whitespace() || c == '.');
+    let chosen = if trimmed.is_empty() {
+        fallback.trim_matches(|c: char| c.is_whitespace() || c == '.')
+    } else {
+        trimmed
+    };
+
+    let mut final_stem: String = chosen.chars().take(150).collect();
+    while final_stem.ends_with('.') || final_stem.ends_with(' ') {
+        final_stem.pop();
+    }
+
+    // Guard against reserved Windows device filenames
+    let upper = final_stem.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "" | "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return "Kick_VOD".to_string();
+    }
+
+    final_stem
+}
+
+/// Builds the full output file path using the VOD/Clip title and disambiguates if the file already exists.
+fn build_output_filepath(
+    output_dir: &str,
+    session_title: &str,
+    channel_slug: &str,
+    ext_str: &str,
+) -> String {
+    let trimmed_dir = output_dir.trim();
+    let lower_dir = trimmed_dir.to_ascii_lowercase();
+    if lower_dir.ends_with(".mkv") || lower_dir.ends_with(".mp4") || lower_dir.ends_with(".ts") {
+        return trimmed_dir.to_string();
+    }
+
+    let fallback_name = if channel_slug.is_empty() {
+        "Kick_VOD".to_string()
+    } else {
+        format!("{}_VOD", channel_slug)
+    };
+    let stem = sanitize_filename(session_title, &fallback_name);
+    let base_dir = Path::new(trimmed_dir);
+
+    let first_candidate = base_dir.join(format!("{}.{}", stem, ext_str));
+    if !first_candidate.exists() {
+        return first_candidate.display().to_string();
+    }
+
+    for idx in 1..1000 {
+        let candidate = base_dir.join(format!("{} ({}).{}", stem, idx, ext_str));
+        if !candidate.exists() {
+            return candidate.display().to_string();
+        }
+    }
+
+    first_candidate.display().to_string()
+}
+
+fn non_empty_str<'a>(val: Option<&'a Value>) -> Option<&'a str> {
+    val.and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 fn ytdlp_extract_kick_fallback(
     raw_url: &str,
     tx: &Sender<WorkerEvent>,
@@ -723,28 +832,23 @@ fn ytdlp_extract_kick_fallback(
         return None;
     }
     let val: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let m3u8_url = val
-        .get("manifest_url")
-        .and_then(|s| s.as_str())
-        .or_else(|| val.get("url").and_then(|s| s.as_str()))
-        .unwrap_or("")
+    let m3u8_url = non_empty_str(val.get("manifest_url"))
+        .or_else(|| non_empty_str(val.get("url")))?
         .to_string();
-    if m3u8_url.is_empty() {
-        return None;
-    }
 
-    let channel_slug = val
-        .get("channel")
-        .or_else(|| val.get("uploader"))
-        .and_then(|s| s.as_str())
+    let channel_slug = non_empty_str(val.get("channel"))
+        .or_else(|| non_empty_str(val.get("uploader")))
+        .or_else(|| non_empty_str(val.get("creator")))
         .unwrap_or("kick_vod")
         .to_string();
-    let session_title = val
-        .get("title")
-        .and_then(|s| s.as_str())
-        .unwrap_or("Kick VOD")
+    let session_title = non_empty_str(val.get("title"))
+        .or_else(|| non_empty_str(val.get("fulltitle")))
+        .unwrap_or(&channel_slug)
         .to_string();
-    let duration_secs = val.get("duration").and_then(|d| d.as_u64()).unwrap_or(0);
+    let duration_secs = val
+        .get("duration")
+        .and_then(|d| d.as_u64().or_else(|| d.as_f64().map(|f| f as u64)))
+        .unwrap_or(0);
     let duration_formatted = if duration_secs > 0 {
         format!(
             "{:02}:{:02}:{:02}",
@@ -765,15 +869,90 @@ fn ytdlp_extract_kick_fallback(
     })
 }
 
-/// Extracts Master M3U8 and metadata from a Kick VOD URL.
+/// Extracts Clip metadata and stream URL from Kick API v2 (`https://kick.com/api/v2/clips/{clip_id}`).
+fn extract_kick_clip(
+    client: &reqwest::blocking::Client,
+    user_hint: &str,
+    clip_id: &str,
+    raw_url: &str,
+    tx: &Sender<WorkerEvent>,
+) -> Result<ExtractedVodMeta, String> {
+    let _ = tx.send(WorkerEvent::Log(format!(
+        "[extractor] Fetching Kick clip metadata for '{}'...",
+        clip_id
+    )));
+    let clip_api = format!("https://kick.com/api/v2/clips/{}", clip_id);
+    if let Ok(val) = get_kick_json(client, &clip_api, Some(tx)) {
+        let clip_obj = val.get("clip").unwrap_or(&val);
+        let stream_url = non_empty_str(clip_obj.get("clip_url"))
+            .or_else(|| non_empty_str(clip_obj.get("video_url")))
+            .or_else(|| non_empty_str(clip_obj.get("source")));
+
+        if let Some(m3u8_url) = stream_url {
+            let channel_slug =
+                non_empty_str(clip_obj.get("channel").and_then(|c| c.get("slug")))
+                    .or_else(|| {
+                        non_empty_str(clip_obj.get("channel").and_then(|c| c.get("username")))
+                    })
+                    .unwrap_or(if user_hint.is_empty() {
+                        "kick_clip"
+                    } else {
+                        user_hint
+                    })
+                    .to_string();
+
+            let session_title = non_empty_str(clip_obj.get("title"))
+                .unwrap_or(clip_id)
+                .to_string();
+
+            let duration_secs = clip_obj
+                .get("duration")
+                .and_then(|d| d.as_u64())
+                .unwrap_or(0);
+            let duration_formatted = if duration_secs > 0 {
+                format!(
+                    "{:02}:{:02}:{:02}",
+                    duration_secs / 3600,
+                    (duration_secs % 3600) / 60,
+                    duration_secs % 60
+                )
+            } else {
+                "Clip".to_string()
+            };
+
+            return Ok(ExtractedVodMeta {
+                m3u8_url: m3u8_url.to_string(),
+                channel_slug,
+                session_title,
+                duration_formatted,
+                source_type: "Kick Clip API".to_string(),
+            });
+        }
+    }
+
+    if let Some(meta) = ytdlp_extract_kick_fallback(raw_url, tx) {
+        return Ok(meta);
+    }
+    Err(format!("Could not extract Kick clip '{}'", clip_id))
+}
+
+/// Extracts Master M3U8 and metadata from a Kick VOD or Clip URL.
 /// Full port of https://github.com/mortyobnoxious/kickvod-extractor
 fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<ExtractedVodMeta, String> {
     let trimmed = raw_url.trim();
     if trimmed.contains(".m3u8") {
+        let fallback_title = trimmed
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.split(&['?', '#'][..]).next())
+            .and_then(|s| s.strip_suffix(".m3u8"))
+            .filter(|s| !s.is_empty() && *s != "master" && *s != "playlist")
+            .unwrap_or("Kick_HLS_Stream")
+            .to_string();
         return Ok(ExtractedVodMeta {
             m3u8_url: trimmed.to_string(),
             channel_slug: "kick_stream".to_string(),
-            session_title: "Direct HLS Stream".to_string(),
+            session_title: fallback_title,
             duration_formatted: "Live/VOD".to_string(),
             source_type: "Direct M3U8 URL".to_string(),
         });
@@ -781,23 +960,52 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
 
     let mut user = "";
     let mut uuid = "";
+    let mut clip_id = "";
+
+    // Check for ?clip= query param first
+    if let Some(q_idx) = trimmed.find("clip=") {
+        let after = &trimmed[q_idx + 5..];
+        clip_id = after.split(&['&', '#'][..]).next().unwrap_or("");
+    }
 
     if let Some(idx) = trimmed.find("kick.com/") {
         let rest = &trimmed[idx + "kick.com/".len()..];
         let mut parts = rest.split('/');
-        if let (Some(p0), Some(p1)) = (parts.next(), parts.next()) {
-            if p1 == "videos" {
-                user = p0;
-                uuid = parts
-                    .next()
-                    .unwrap_or("")
-                    .split(&['?', '#'][..])
-                    .next()
-                    .unwrap_or("");
-            } else if p0 == "video" {
-                uuid = p1.split(&['?', '#'][..]).next().unwrap_or("");
+        if let Some(p0) = parts.next() {
+            let clean_p0 = p0.split(&['?', '#'][..]).next().unwrap_or("");
+            if let Some(p1) = parts.next() {
+                let clean_p1 = p1.split(&['?', '#'][..]).next().unwrap_or("");
+                if clean_p1 == "videos" {
+                    user = clean_p0;
+                    uuid = parts
+                        .next()
+                        .unwrap_or("")
+                        .split(&['?', '#'][..])
+                        .next()
+                        .unwrap_or("");
+                } else if clean_p0 == "video" {
+                    uuid = clean_p1;
+                } else if clean_p1 == "clips" {
+                    user = clean_p0;
+                    clip_id = parts
+                        .next()
+                        .unwrap_or("")
+                        .split(&['?', '#'][..])
+                        .next()
+                        .unwrap_or("");
+                } else if clean_p0 == "clips" || clean_p0 == "clip" {
+                    clip_id = clean_p1;
+                }
+            } else if !clean_p0.is_empty() {
+                user = clean_p0;
             }
         }
+    }
+
+    let client = shared_http_client()?;
+
+    if !clip_id.is_empty() {
+        return extract_kick_clip(client, user, clip_id, trimmed, tx);
     }
 
     if uuid.is_empty() {
@@ -805,11 +1013,9 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
             return Ok(meta);
         }
         return Err(
-            "Invalid Kick VOD URL (expected https://kick.com/{channel}/videos/{uuid})".to_string(),
+            "Invalid Kick VOD/Clip URL (expected https://kick.com/{channel}/videos/{uuid})".to_string(),
         );
     }
-
-    let client = shared_http_client()?;
 
     // 1. Try v1/video/{uuid} first, then fallback to v2/channels/{user}/videos and v1/channels/{user}
     let v1_url = format!("https://kick.com/api/v1/video/{}", uuid);
@@ -913,26 +1119,42 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
 
     let ls = vod.get("livestream").or(v2_matched_obj.as_ref());
 
-    let channel_slug = ls
-        .and_then(|l| l.get("channel"))
-        .and_then(|c| c.get("slug"))
-        .and_then(|s| s.as_str())
+    let channel_slug = non_empty_str(ls.and_then(|l| l.get("channel")).and_then(|c| c.get("slug")))
+        .or_else(|| non_empty_str(vod.get("channel").and_then(|c| c.get("slug"))))
         .unwrap_or(if user.is_empty() { "kick_vod" } else { user })
         .to_string();
 
-    let session_title = ls
-        .and_then(|l| l.get("session_title"))
-        .or_else(|| vod.get("session_title"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("Kick Broadcast VOD")
-        .to_string();
+    // Pull the actual VOD/Clip title from all possible Kick v1 & v2 fields
+    let session_title = non_empty_str(ls.and_then(|l| l.get("session_title")))
+        .or_else(|| non_empty_str(ls.and_then(|l| l.get("title"))))
+        .or_else(|| non_empty_str(vod.get("session_title")))
+        .or_else(|| non_empty_str(vod.get("title")))
+        .or_else(|| {
+            non_empty_str(
+                v2_matched_obj
+                    .as_ref()
+                    .and_then(|m| m.get("session_title").or_else(|| m.get("title"))),
+            )
+        })
+        .or_else(|| {
+            non_empty_str(
+                vod.get("video")
+                    .and_then(|v| v.get("session_title").or_else(|| v.get("title"))),
+            )
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} - {}", channel_slug, uuid));
 
     let duration_ms = ls
         .and_then(|l| l.get("duration"))
         .or_else(|| vod.get("duration"))
         .and_then(|d| d.as_u64())
         .unwrap_or(0);
-    let total_secs = duration_ms / 1000;
+    let total_secs = if duration_ms > 100_000 {
+        duration_ms / 1000
+    } else {
+        duration_ms
+    };
     let duration_formatted = if total_secs > 0 {
         format!(
             "{:02}:{:02}:{:02}",
@@ -945,26 +1167,18 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
     };
 
     // 2. Direct source URL from Kick API (v1 or v2)
-    let direct_source = vod
-        .get("source")
-        .and_then(|s| s.as_str())
-        .or_else(|| {
-            v2_matched_obj
-                .as_ref()
-                .and_then(|m| m.get("source"))
-                .and_then(|s| s.as_str())
-        });
+    let direct_source = non_empty_str(vod.get("source")).or_else(|| {
+        non_empty_str(v2_matched_obj.as_ref().and_then(|m| m.get("source")))
+    });
 
     if let Some(src) = direct_source {
-        if !src.is_empty() {
-            return Ok(ExtractedVodMeta {
-                m3u8_url: src.to_string(),
-                channel_slug,
-                session_title,
-                duration_formatted,
-                source_type: "Source URL from API".to_string(),
-            });
-        }
+        return Ok(ExtractedVodMeta {
+            m3u8_url: src.to_string(),
+            channel_slug,
+            session_title,
+            duration_formatted,
+            source_type: "Source URL from API".to_string(),
+        });
     }
 
     // 3. Reconstruct AWS IVS path from thumbnail & UTC timestamp + prefixes.json
@@ -1207,20 +1421,13 @@ fn draw_nav_icon(ui: &mut egui::Ui, tab: Tab, size: f32, color: Color32) {
     }
 }
 
-/// Sleek 8px progress bar with high-contrast right-aligned tabular percentage.
+/// Sleek 8px progress bar inside a single-line horizontal layout (never expands vertically).
 fn draw_progress_row(ui: &mut egui::Ui, progress: f32) {
     let clamped = progress.clamp(0.0, 1.0);
     let pct = (clamped * 100.0).round() as u32;
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(
-            RichText::new(format!("{:>3}%", pct))
-                .size(12.0)
-                .family(FontFamily::Monospace)
-                .strong()
-                .color(TEXT_PRIMARY),
-        );
-        ui.add_space(10.0);
-        let track_w = ui.available_width().max(40.0);
+    ui.horizontal(|ui| {
+        let pct_label_w = 40.0;
+        let track_w = (ui.available_width() - pct_label_w - 10.0).max(40.0);
         let (track_rect, _) = ui.allocate_exact_size(Vec2::new(track_w, 8.0), Sense::hover());
         let painter = ui.painter();
         painter.rect_filled(track_rect, Rounding::same(4.0), BG_ELEVATED);
@@ -1232,6 +1439,16 @@ fn draw_progress_row(ui: &mut egui::Ui, progress: f32) {
                 Rect::from_min_size(track_rect.min, Vec2::new(fill_w, track_rect.height()));
             painter.rect_filled(fill_rect, Rounding::same(4.0), ACCENT_GREEN);
         }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!("{:>3}%", pct))
+                    .size(12.0)
+                    .family(FontFamily::Monospace)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+        });
     });
 }
 
@@ -1466,8 +1683,8 @@ impl FiveKdApp {
                         return;
                     }
                     let _ = tx.send(WorkerEvent::Log(format!(
-                        "[extractor] Extracted Master M3U8 ({}): {}",
-                        meta.source_type, meta.m3u8_url
+                        "[extractor] Extracted '{}' ({}): {}",
+                        meta.session_title, meta.source_type, meta.m3u8_url
                     )));
                     let _ = tx.send(WorkerEvent::Extracted(id, meta.clone()));
                     notifier.wake_immediate();
@@ -1488,24 +1705,13 @@ impl FiveKdApp {
                 return;
             }
 
-            let default_filename = format!("{}_vod.{}", extracted.channel_slug, ext.as_str());
-            let final_output = if custom_out.ends_with('\\') || custom_out.ends_with('/') {
-                format!("{}{}", custom_out, default_filename)
-            } else if custom_out.ends_with(".mkv")
-                || custom_out.ends_with(".mp4")
-                || custom_out.ends_with(".ts")
-            {
-                custom_out
-            } else {
-                #[cfg(target_os = "windows")]
-                {
-                    format!("{}\\{}", custom_out, default_filename)
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    format!("{}/{}", custom_out, default_filename)
-                }
-            };
+            // Pull the VOD/Clip title and make it the name of the output file
+            let final_output = build_output_filepath(
+                &custom_out,
+                &extracted.session_title,
+                &extracted.channel_slug,
+                ext.as_str(),
+            );
 
             let mut cmd = Command::new("yt-dlp");
             cmd.args([
@@ -1551,7 +1757,7 @@ impl FiveKdApp {
             cmd.creation_flags(CREATE_NO_WINDOW);
 
             let _ = tx.send(WorkerEvent::Log(format!(
-                ">>> Executing yt-dlp -> {}",
+                ">>> Saving VOD/Clip as -> {}",
                 final_output
             )));
             notifier.wake_immediate();
@@ -1671,8 +1877,8 @@ impl FiveKdApp {
                 WorkerEvent::Extracted(id, meta) => {
                     if let Some(item) = self.active_downloads.iter_mut().find(|i| i.id == id) {
                         item.title = format!(
-                            "{} - {} ({})",
-                            meta.channel_slug, meta.session_title, meta.duration_formatted
+                            "{} ({})",
+                            meta.session_title, meta.duration_formatted
                         );
                         item.url = meta.m3u8_url;
                         item.status_text = "Downloading stream via yt-dlp + ffmpeg...".to_string();
@@ -1712,30 +1918,25 @@ impl FiveKdApp {
             .inner_margin(egui::Margin::symmetric(16.0, 12.0))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !item.output_path.is_empty() && item.status == DownloadStatus::Completed {
-                        let open_btn = styled_secondary_btn(
-                            "Open Folder",
-                            TEXT_PRIMARY,
-                            BORDER_HOVER,
-                            Vec2::new(96.0, 30.0),
-                        );
-                        if ui.add(open_btn).clicked() {
-                            open_output_folder(&item.output_path, item.saved_file_path.as_deref());
-                        }
-                        ui.add_space(12.0);
-                    }
+                ui.horizontal(|ui| {
+                    let show_open_btn =
+                        !item.output_path.is_empty() && item.status == DownloadStatus::Completed;
+                    let open_btn_w = if show_open_btn { 96.0 + 12.0 } else { 0.0 };
+                    let info_w = (ui.available_width() - open_btn_w).max(80.0);
 
-                    let rem_w = ui.available_width().max(80.0);
                     ui.allocate_ui_with_layout(
-                        Vec2::new(rem_w, 0.0),
+                        Vec2::new(info_w, 0.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            ui.label(
-                                RichText::new(&item.title)
-                                    .size(13.5)
-                                    .strong()
-                                    .color(TEXT_PRIMARY),
+                            ui.set_max_width(info_w);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&item.title)
+                                        .size(13.5)
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .truncate(),
                             );
                             ui.add_space(3.0);
                             ui.horizontal_wrapped(|ui| {
@@ -1754,15 +1955,35 @@ impl FiveKdApp {
                                         .color(TEXT_MUTED),
                                 );
                                 ui.label(RichText::new("·").size(12.0).color(TEXT_MUTED));
-                                ui.label(
-                                    RichText::new(&item.status_text)
-                                        .size(11.5)
-                                        .family(FontFamily::Monospace)
-                                        .color(TEXT_MUTED),
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&item.status_text)
+                                            .size(11.5)
+                                            .family(FontFamily::Monospace)
+                                            .color(TEXT_MUTED),
+                                    )
+                                    .truncate(),
                                 );
                             });
                         },
                     );
+
+                    if show_open_btn {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let open_btn = styled_secondary_btn(
+                                "Open Folder",
+                                TEXT_PRIMARY,
+                                BORDER_HOVER,
+                                Vec2::new(96.0, 30.0),
+                            );
+                            if ui.add(open_btn).clicked() {
+                                open_output_folder(
+                                    &item.output_path,
+                                    item.saved_file_path.as_deref(),
+                                );
+                            }
+                        });
+                    }
                 });
             });
     }
@@ -1792,7 +2013,7 @@ impl eframe::App for FiveKdApp {
         // Left Navigation Rail (#000000 with subtle hairline divider & footer zoom controls)
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .exact_width(214.0)
+            .exact_width(220.0)
             .frame(
                 egui::Frame::none()
                     .fill(BG_CANVAS)
@@ -1802,7 +2023,7 @@ impl eframe::App for FiveKdApp {
             .show(ctx, |ui| {
                 // Header Brand Block (single source of branding — no redundant top bar)
                 ui.horizontal(|ui| {
-                    draw_brand_mark(ui, 30.0);
+                    draw_brand_mark(ui, 32.0);
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
@@ -1980,14 +2201,14 @@ impl eframe::App for FiveKdApp {
             .frame(
                 egui::Frame::none()
                     .fill(BG_CANVAS)
-                    .inner_margin(egui::Margin::symmetric(24.0, 22.0)),
+                    .inner_margin(egui::Margin::symmetric(28.0, 24.0)),
             )
             .show(ctx, |ui| match self.current_tab {
                 Tab::Downloads => {
                     let folder_selected = self.has_chosen_folder();
                     let can_download = folder_selected && !self.url_input.trim().is_empty();
 
-                    // 1. Primary URL Bar [Input | Paste | Download] with responsive right-to-left anchoring
+                    // 1. Primary URL Bar [Input | Paste | Download] inside single-row horizontal layout
                     egui::Frame::none()
                         .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
@@ -1995,7 +2216,53 @@ impl eframe::App for FiveKdApp {
                         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.horizontal(|ui| {
+                                let paste_w = 72.0;
+                                let dl_w = 104.0;
+                                let spacing = ui.spacing().item_spacing.x;
+                                let input_w =
+                                    (ui.available_width() - paste_w - dl_w - spacing * 2.0)
+                                        .max(100.0);
+
+                                let text_edit = egui::TextEdit::singleline(&mut self.url_input)
+                                    .hint_text("Paste Kick VOD or clip URL here...")
+                                    .frame(false)
+                                    .font(FontId::proportional(14.5))
+                                    .desired_width(input_w)
+                                    .min_size(Vec2::new(input_w, 34.0))
+                                    .vertical_align(egui::Align::Center);
+
+                                let resp = ui.add(text_edit);
+                                if resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    && can_download
+                                {
+                                    self.start_download();
+                                }
+
+                                // One-Click Paste button
+                                let paste_btn = styled_secondary_btn(
+                                    "Paste",
+                                    TEXT_PRIMARY,
+                                    BORDER_HOVER,
+                                    Vec2::new(paste_w, 34.0),
+                                );
+                                if ui
+                                    .add(paste_btn)
+                                    .on_hover_text("Paste URL from clipboard")
+                                    .clicked()
+                                {
+                                    if let Some(clip) = read_clipboard_text() {
+                                        self.url_input = clip;
+                                        self.paste_notice = None;
+                                    } else {
+                                        self.paste_notice =
+                                            Some(("Clipboard is empty".to_string(), Instant::now()));
+                                        ctx.request_repaint_after(Duration::from_secs(2));
+                                    }
+                                }
+
+                                // Primary CTA: Download
                                 let dl_clicked = ui
                                     .scope(|ui| {
                                         if can_download {
@@ -2033,7 +2300,7 @@ impl eframe::App for FiveKdApp {
                                             },
                                         ))
                                         .rounding(Rounding::same(8.0))
-                                        .min_size(Vec2::new(104.0, 34.0));
+                                        .min_size(Vec2::new(dl_w, 34.0));
 
                                         ui.add_enabled(can_download, dl_btn)
                                             .on_disabled_hover_text(if !folder_selected {
@@ -2044,53 +2311,10 @@ impl eframe::App for FiveKdApp {
                                             .clicked()
                                     })
                                     .inner;
+
                                 if dl_clicked {
                                     self.start_download();
                                 }
-
-                                // One-Click Paste button
-                                let paste_btn = styled_secondary_btn(
-                                    "Paste",
-                                    TEXT_PRIMARY,
-                                    BORDER_HOVER,
-                                    Vec2::new(66.0, 34.0),
-                                );
-                                if ui
-                                    .add(paste_btn)
-                                    .on_hover_text("Paste URL from clipboard")
-                                    .clicked()
-                                {
-                                    if let Some(clip) = read_clipboard_text() {
-                                        self.url_input = clip;
-                                        self.paste_notice = None;
-                                    } else {
-                                        self.paste_notice =
-                                            Some(("Clipboard is empty".to_string(), Instant::now()));
-                                        ctx.request_repaint_after(Duration::from_secs(2));
-                                    }
-                                }
-
-                                // Flexible URL TextEdit in left-to-right sub-layout
-                                let rem_w = ui.available_width().max(80.0);
-                                ui.allocate_ui_with_layout(
-                                    Vec2::new(rem_w, 34.0),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        let text_edit =
-                                            egui::TextEdit::singleline(&mut self.url_input)
-                                                .hint_text("Paste Kick VOD or clip URL here...")
-                                                .frame(false)
-                                                .font(FontId::proportional(14.5))
-                                                .desired_width(f32::INFINITY);
-                                        let resp = ui.add(text_edit);
-                                        if resp.lost_focus()
-                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                            && can_download
-                                        {
-                                            self.start_download();
-                                        }
-                                    },
-                                );
                             });
                         });
 
@@ -2099,9 +2323,9 @@ impl eframe::App for FiveKdApp {
                         ui.label(RichText::new(notice).size(11.5).color(STATUS_CANCELED));
                     }
 
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
 
-                    // 2. Stream Options Strip (Start Time, End Time, Resolution, Format)
+                    // 2. Stream Options Strip (Start Time, End Time, Quality, Format)
                     let mut config_dirty = false;
                     egui::Frame::none()
                         .fill(BG_SURFACE)
@@ -2117,23 +2341,27 @@ impl eframe::App for FiveKdApp {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.start_time)
                                         .hint_text("00:00:00")
-                                        .desired_width(88.0)
+                                        .desired_width(92.0)
+                                        .min_size(Vec2::new(92.0, 28.0))
+                                        .vertical_align(egui::Align::Center)
                                         .font(FontId::monospace(12.0)),
                                 );
 
-                                ui.add_space(6.0);
+                                ui.add_space(8.0);
                                 ui.label(RichText::new("End").size(12.5).color(TEXT_MUTED));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.end_time)
                                         .hint_text("HH:MM:SS")
-                                        .desired_width(88.0)
+                                        .desired_width(92.0)
+                                        .min_size(Vec2::new(92.0, 28.0))
+                                        .vertical_align(egui::Align::Center)
                                         .font(FontId::monospace(12.0)),
                                 );
 
                                 ui.add_space(8.0);
                                 ui.label(RichText::new("Quality").size(12.5).color(TEXT_MUTED));
                                 egui::ComboBox::from_id_salt("resolution_combo")
-                                    .width(142.0)
+                                    .width(152.0)
                                     .selected_text(
                                         RichText::new(self.resolution.label())
                                             .size(12.0)
@@ -2198,7 +2426,7 @@ impl eframe::App for FiveKdApp {
                                         },
                                     ))
                                     .rounding(Rounding::same(6.0))
-                                    .min_size(Vec2::new(46.0, 26.0));
+                                    .min_size(Vec2::new(50.0, 28.0));
 
                                     if ui.add(btn).clicked() && self.container_ext != ext {
                                         self.container_ext = ext;
@@ -2211,59 +2439,31 @@ impl eframe::App for FiveKdApp {
                         self.persist_config();
                     }
 
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
 
-                    // 3. Output Destination Row (remembered across app restarts)
+                    // 3. Output Destination Row (single-row horizontal layout matching web preview)
                     egui::Frame::none()
                         .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
                         .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-                        .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let folder_btn = styled_secondary_btn(
-                                    "Choose Folder",
-                                    if folder_selected {
-                                        TEXT_PRIMARY
-                                    } else {
-                                        ACCENT_GREEN
-                                    },
-                                    if folder_selected {
-                                        BORDER_HOVER
-                                    } else {
-                                        ACCENT_GREEN
-                                    },
-                                    Vec2::new(112.0, 30.0),
-                                );
+                            ui.horizontal(|ui| {
+                                let btn_w = 114.0;
+                                let left_w = (ui.available_width() - btn_w - 12.0).max(100.0);
 
-                                if ui.add(folder_btn).clicked() {
-                                    let mut dialog = rfd::FileDialog::new();
-                                    if folder_selected && Path::new(&self.output_path).is_dir() {
-                                        dialog = dialog.set_directory(&self.output_path);
-                                    }
-                                    if let Some(folder) = dialog.pick_folder() {
-                                        let chosen = folder.display().to_string();
-                                        self.output_path = chosen.clone();
-                                        self.persist_config();
-                                        self.push_log(format!(
-                                            "[config] Saved output destination: {}",
-                                            chosen
-                                        ));
-                                    }
-                                }
-
-                                let rem_w = ui.available_width().max(80.0);
                                 ui.allocate_ui_with_layout(
-                                    Vec2::new(rem_w, 30.0),
+                                    Vec2::new(left_w, 30.0),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        ui.set_max_width(left_w);
                                         ui.label(
                                             RichText::new("Output Folder")
                                                 .size(12.5)
                                                 .color(TEXT_MUTED),
                                         );
-                                        ui.add_space(4.0);
+                                        ui.add_space(6.0);
                                         let display_path = if folder_selected {
                                             self.output_path.as_str()
                                         } else {
@@ -2284,10 +2484,48 @@ impl eframe::App for FiveKdApp {
                                         );
                                     },
                                 );
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let folder_btn = styled_secondary_btn(
+                                            "Choose Folder",
+                                            if folder_selected {
+                                                TEXT_PRIMARY
+                                            } else {
+                                                ACCENT_GREEN
+                                            },
+                                            if folder_selected {
+                                                BORDER_HOVER
+                                            } else {
+                                                ACCENT_GREEN
+                                            },
+                                            Vec2::new(btn_w, 30.0),
+                                        );
+
+                                        if ui.add(folder_btn).clicked() {
+                                            let mut dialog = rfd::FileDialog::new();
+                                            if folder_selected
+                                                && Path::new(&self.output_path).is_dir()
+                                            {
+                                                dialog = dialog.set_directory(&self.output_path);
+                                            }
+                                            if let Some(folder) = dialog.pick_folder() {
+                                                let chosen = folder.display().to_string();
+                                                self.output_path = chosen.clone();
+                                                self.persist_config();
+                                                self.push_log(format!(
+                                                    "[config] Saved output destination: {}",
+                                                    chosen
+                                                ));
+                                            }
+                                        }
+                                    },
+                                );
                             });
                         });
 
-                    ui.add_space(16.0);
+                    ui.add_space(18.0);
 
                     // 4. Scrollable Queue & Recent Downloads Region
                     egui::ScrollArea::vertical()
@@ -2313,14 +2551,14 @@ impl eframe::App for FiveKdApp {
                                     );
                                 }
                             });
-                            ui.add_space(6.0);
+                            ui.add_space(8.0);
 
                             if self.active_downloads.is_empty() {
                                 egui::Frame::none()
                                     .fill(BG_SURFACE)
                                     .rounding(Rounding::same(10.0))
                                     .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-                                    .inner_margin(egui::Margin::symmetric(16.0, 16.0))
+                                    .inner_margin(egui::Margin::symmetric(16.0, 15.0))
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
                                         let hint_msg = if folder_selected {
@@ -2343,42 +2581,50 @@ impl eframe::App for FiveKdApp {
                                         .inner_margin(egui::Margin::same(14.0))
                                         .show(ui, |ui| {
                                             ui.set_min_width(ui.available_width());
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    let cancel_btn = styled_secondary_btn(
-                                                        "Cancel",
-                                                        STATUS_FAILED,
-                                                        BORDER_HOVER,
-                                                        Vec2::new(72.0, 28.0),
-                                                    );
-                                                    if ui.add(cancel_btn).clicked() {
-                                                        cancel_target_id = Some(item.id);
-                                                    }
+                                            ui.horizontal(|ui| {
+                                                let cancel_w = 72.0;
+                                                let title_w =
+                                                    (ui.available_width() - cancel_w - 10.0)
+                                                        .max(80.0);
+                                                ui.allocate_ui_with_layout(
+                                                    Vec2::new(title_w, 28.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.set_max_width(title_w);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&item.title)
+                                                                    .size(13.5)
+                                                                    .strong()
+                                                                    .color(TEXT_PRIMARY),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    },
+                                                );
 
-                                                    let rem_w = ui.available_width().max(80.0);
-                                                    ui.allocate_ui_with_layout(
-                                                        Vec2::new(rem_w, 28.0),
-                                                        egui::Layout::left_to_right(
-                                                            egui::Align::Center,
-                                                        ),
-                                                        |ui| {
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    RichText::new(&item.title)
-                                                                        .size(13.5)
-                                                                        .strong()
-                                                                        .color(TEXT_PRIMARY),
-                                                                )
-                                                                .truncate(),
-                                                            );
-                                                        },
-                                                    );
-                                                },
-                                            );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        let cancel_btn = styled_secondary_btn(
+                                                            "Cancel",
+                                                            STATUS_FAILED,
+                                                            BORDER_HOVER,
+                                                            Vec2::new(cancel_w, 28.0),
+                                                        );
+                                                        if ui.add(cancel_btn).clicked() {
+                                                            cancel_target_id = Some(item.id);
+                                                        }
+                                                    },
+                                                );
+                                            });
                                             ui.add_space(8.0);
                                             draw_progress_row(ui, item.progress);
-                                            ui.add_space(5.0);
+                                            ui.add_space(6.0);
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     RichText::new(format!(
@@ -2413,7 +2659,7 @@ impl eframe::App for FiveKdApp {
                                 }
                             }
 
-                            ui.add_space(16.0);
+                            ui.add_space(18.0);
 
                             // Recent Downloads Section
                             ui.label(
@@ -2422,14 +2668,14 @@ impl eframe::App for FiveKdApp {
                                     .strong()
                                     .color(TEXT_PRIMARY),
                             );
-                            ui.add_space(6.0);
+                            ui.add_space(8.0);
 
                             if self.completed_downloads.is_empty() {
                                 egui::Frame::none()
                                     .fill(BG_SURFACE)
                                     .rounding(Rounding::same(10.0))
                                     .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-                                    .inner_margin(egui::Margin::symmetric(16.0, 16.0))
+                                    .inner_margin(egui::Margin::symmetric(16.0, 15.0))
                                     .show(ui, |ui| {
                                         ui.set_min_width(ui.available_width());
                                         ui.label(
@@ -2499,7 +2745,7 @@ impl eframe::App for FiveKdApp {
                                             } else if line.contains("[cancel]") {
                                                 STATUS_CANCELED
                                             } else if line.starts_with(">>>")
-                                                || line.contains("Extracted Master M3U8")
+                                                || line.contains("Extracted '")
                                             {
                                                 ACCENT_GREEN
                                             } else {

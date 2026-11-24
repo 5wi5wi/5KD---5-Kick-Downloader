@@ -1420,9 +1420,31 @@
         throw new Error('Could not fetch Kick API metadata');
       }
 
+      function sanitizeFilename(rawTitle, fallback) {
+        const cleaned = String(rawTitle || '')
+          .replace(/[\x00-\x1f\/\\:*?"<>|]+/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .replace(/^[.\s]+|[.\s]+$/g, '');
+        return (cleaned || fallback || 'Kick_VOD').slice(0, 150);
+      }
+
       async function extractKickVodReal(rawUrl) {
+        const clipMatch =
+          rawUrl.match(/kick\.com\/(?:[^\/]+\/)?clips?\/([a-zA-Z0-9_-]+)/i) ||
+          rawUrl.match(/[?&]clip=([a-zA-Z0-9_-]+)/i);
+        if (clipMatch) {
+          const clipId = clipMatch[1];
+          logLine(`[extractor] Fetching Kick clip metadata for '${clipId}'...`);
+          const clipRes = await getKickJSON(`https://kick.com/api/v2/clips/${clipId}`);
+          const clipObj = clipRes?.clip || clipRes;
+          const clipTitle = (clipObj?.title || clipId).trim();
+          const clipSrc = clipObj?.clip_url || clipObj?.video_url || clipObj?.source || rawUrl;
+          return { m3u8: clipSrc, title: clipTitle, sourceType: 'Kick Clip API' };
+        }
+
         const m = rawUrl.match(/kick\.com\/([^\/]+)\/videos\/([a-f0-9-]+)/i);
-        if (!m) return { m3u8: rawUrl, title: rawUrl, sourceType: 'Direct URL' };
+        if (!m) return { m3u8: rawUrl, title: 'Kick_HLS_Stream', sourceType: 'Direct URL' };
         const user = m[1];
         const uuid = m[2];
         let vod = null;
@@ -1457,10 +1479,18 @@
         const activeVod = vod || v2Match;
         if (!activeVod) throw new Error('VOD not found in Kick database');
         const ls = activeVod.livestream || v2Match;
-        const title = ls?.session_title || activeVod.session_title || `${user} VOD`;
+        const title = (
+          ls?.session_title ||
+          ls?.title ||
+          activeVod.session_title ||
+          activeVod.title ||
+          v2Match?.session_title ||
+          v2Match?.title ||
+          `${user}_${uuid}`
+        ).trim();
         const src = activeVod.source || v2Match?.source;
         if (src) {
-          return { m3u8: src, title: `${user} - ${title}`, sourceType: 'Source URL from API' };
+          return { m3u8: src, title, sourceType: 'Source URL from API' };
         }
         throw new Error('No direct source found');
       }
@@ -1517,20 +1547,27 @@
 
         logLine('[extractor] Analyzing URL: ' + url);
 
-        let meta = { m3u8: url, title: url, sourceType: 'Direct' };
+        let meta = { m3u8: url, title: 'Kick_VOD', sourceType: 'Direct' };
         try {
           meta = await extractKickVodReal(url);
           if (activeCanceled) return;
-          logLine(`[extractor] Extracted Master M3U8 (${meta.sourceType}): ${meta.m3u8}`);
+          logLine(`[extractor] Extracted '${meta.title}' (${meta.sourceType}): ${meta.m3u8}`);
         } catch (err) {
           if (activeCanceled) return;
           logLine(`[extractor error] ${err.message}`);
         }
 
         if (activeCanceled || !activeItem) return;
+        const safeFileStem = sanitizeFilename(meta.title, 'Kick_VOD');
+        const sep = folder.includes('/') ? '/' : '\\';
+        const cleanFolder = folder.replace(/[\\\/]+$/, '');
+        const finalOutputPath = `${cleanFolder}${sep}${safeFileStem}.${currentExt}`;
+
         activeItem.title = meta.title;
+        activeItem.outputFile = finalOutputPath;
         activeItem.pct = 12;
-        activeItem.statusText = 'Downloading stream via yt-dlp + ffmpeg...';
+        activeItem.statusText = 'Saving as ' + finalOutputPath;
+        logLine('>>> Saving VOD/Clip as -> ' + finalOutputPath);
         renderActiveQueue();
 
         activeTimer = setInterval(() => {
@@ -1545,7 +1582,7 @@
           const txt = document.getElementById('prog-txt');
           if (bar) bar.style.width = activeItem.pct + '%';
           if (pctEl) pctEl.textContent = activeItem.pct + '%';
-          if (txt) txt.textContent = 'Downloading via yt-dlp + ffmpeg -> ' + meta.m3u8;
+          if (txt) txt.textContent = 'Downloading via yt-dlp + ffmpeg -> ' + finalOutputPath;
 
           if (activeItem.pct >= 100) {
             clearInterval(activeTimer);
@@ -1559,9 +1596,9 @@
               folder: finished.folder,
               status: 'completed',
               statusLabel: 'Completed',
-              detail: 'Saved to ' + finished.folder
+              detail: 'Saved to ' + finished.outputFile
             });
-            logLine('[download] 100% Completed: ' + finished.title);
+            logLine('[download] 100% Completed: ' + finished.outputFile);
             renderActiveQueue();
             renderHistoryLists();
           }
