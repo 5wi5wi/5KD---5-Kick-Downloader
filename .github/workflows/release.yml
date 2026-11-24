@@ -1,61 +1,186 @@
-name: Release 1.0v (Windows EXE)
+name: Multi-Platform Release Build
 
 on:
+  release:
+    types: [published]
   push:
-    branches: [ main, master ]
     tags:
-      - '1.0v'
       - 'v*'
       - '*v'
+      - '[0-9]+.[0-9]+*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to publish (e.g. 1.0v or v1.1.0)'
+        required: false
+        default: '1.0v'
 
 permissions:
   contents: write
 
 jobs:
-  release-windows-exe:
-    name: Build & Publish 5KD.exe (1.0v)
-    runs-on: windows-latest
+  build:
+    name: Build (${{ matrix.platform_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform_name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: 5KD.exe
+            asset_name: 5KD-windows-x86_64.exe
+            archive_name: 5KD-windows-x86_64.zip
+
+          - platform_name: Windows ARM64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            bin_name: 5KD.exe
+            asset_name: 5KD-windows-arm64.exe
+            archive_name: 5KD-windows-arm64.zip
+
+          - platform_name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: 5KD
+            asset_name: 5KD-linux-x86_64
+            archive_name: 5KD-linux-x86_64.tar.gz
+
+          - platform_name: macOS Apple Silicon (ARM64)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin_name: 5KD
+            asset_name: 5KD-macos-arm64
+            archive_name: 5KD-macos-arm64.tar.gz
+
+          - platform_name: macOS Intel (x86_64)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin_name: 5KD
+            asset_name: 5KD-macos-x86_64
+            archive_name: 5KD-macos-x86_64.tar.gz
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install stable Rust toolchain
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl1-mesa-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: Build optimized release binary (5KD.exe)
-        run: cargo build --release
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} || cargo build --release --target ${{ matrix.target }}
 
-      - name: Upload 5KD.exe Build Artifact
+      - name: Package Windows release assets
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $src = "target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          Copy-Item $src "dist/${{ matrix.asset_name }}"
+          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") {
+            Copy-Item $src "dist/5KD.exe"
+          }
+          Compress-Archive -Path "dist/${{ matrix.asset_name }}" -DestinationPath "dist/${{ matrix.archive_name }}" -Force
+
+      - name: Package Unix release assets (Linux & macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          chmod +x "$SRC"
+          cp "$SRC" "dist/${{ matrix.asset_name }}"
+          tar -czf "dist/${{ matrix.archive_name }}" -C dist "${{ matrix.asset_name }}"
+
+      - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 5KD-1.0v-windows-x64
-          path: target/release/5KD.exe
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
-      - name: Publish GitHub Release (1.0v)
+  publish:
+    name: Publish Multi-Platform GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Resolve Release Tag
+        id: resolve_tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          else
+            TAG="1.0v"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create or Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: 1.0v
-          name: "5KD - 5wi's Kick Downloader (1.0v)"
+          tag_name: ${{ steps.resolve_tag.outputs.tag }}
+          name: "5KD - 5wi's Kick Downloader (${{ steps.resolve_tag.outputs.tag }})"
           body: |
-            ## 5KD — 5wi's Kick Downloader `1.0v`
+            ## 5KD — 5wi's Kick Downloader `${{ steps.resolve_tag.outputs.tag }}`
+
+            ### Precompiled Binaries
+            | Platform | Architecture | Direct Binary | Archive |
+            | :--- | :--- | :--- | :--- |
+            | **Windows** | x86_64 (64-bit) | `5KD-windows-x86_64.exe` / `5KD.exe` | `5KD-windows-x86_64.zip` |
+            | **Windows** | ARM64 | `5KD-windows-arm64.exe` | `5KD-windows-arm64.zip` |
+            | **Linux** | x86_64 (64-bit) | `5KD-linux-x86_64` | `5KD-linux-x86_64.tar.gz` |
+            | **macOS** | Apple Silicon (M1–M4) | `5KD-macos-arm64` | `5KD-macos-arm64.tar.gz` |
+            | **macOS** | Intel (x86_64) | `5KD-macos-x86_64` | `5KD-macos-x86_64.tar.gz` |
 
             ### Highlights
-            - **Native Rust Desktop App (`5KD.exe`)**: Built with `eframe`/`egui` with embedded `#00e701` pixel-art `5` icon.
-            - **Integrated Kick VOD M3U8 Extractor**: Automatically resolves both `v1/video/{uuid}` and modern UUIDv7 `v2/channels/{user}/videos` VODs, plus CDN prefix scanning (`prefixes.json`).
-            - **Multi-Threaded HLS Engine**: Powered by `yt-dlp` (`-N 8`) and `ffmpeg` with custom browser headers.
-            - **Lossless Time Slicing**: Download specific segments using Start Time (`-ss`) and End Time (`-to`).
-            - **Queue & Process Control**: Output folder enforcement and one-click **Cancel** for active downloads.
-            - **UI Scaling**: Top-bar zoom controls (`100%` to `150%`).
+            - **Native Rust Desktop App**: Pure-black `#000000` UI with `#00E701` Kick green accents, geometric vector icons, event-driven `0%` idle CPU rendering, and virtualized terminal output.
+            - **Persistent Output Folder**: Automatically remembers your chosen output folder, quality, container format, and zoom level across restarts.
+            - **Integrated Kick VOD M3U8 Extractor**: Resolves `v1/video/{uuid}`, UUIDv7 `v2/channels/{user}/videos`, and CDN prefixes (`prefixes.json`) with silent background fallbacks.
+            - **Multi-Threaded HLS Engine**: Powered by `yt-dlp` (`-N 8`) and `ffmpeg` with lossless time slicing (`-ss` / `-to`).
 
             ### Requirements
-            - Windows 10/11 (64-bit)
-            - `yt-dlp` and `ffmpeg` available in your system `PATH` (`winget install yt-dlp.yt-dlp Gyan.FFmpeg`)
+            - `yt-dlp` and `ffmpeg` installed and available in your system `PATH`:
+              - **Windows**: `winget install yt-dlp.yt-dlp Gyan.FFmpeg`
+              - **macOS**: `brew install yt-dlp ffmpeg`
+              - **Linux**: `sudo apt install yt-dlp ffmpeg`
           files: |
-            target/release/5KD.exe
+            release-assets/*
           draft: false
           prerelease: false

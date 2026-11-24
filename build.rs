@@ -89,6 +89,7 @@ fn generate_ico_bytes() -> Vec<u8> {
     buf
 }
 
+#[cfg(windows)]
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -101,3 +102,7 @@ fn main() {
         }
     }
 }
+
+#[cfg(not(windows))]
+fn main() {}
+

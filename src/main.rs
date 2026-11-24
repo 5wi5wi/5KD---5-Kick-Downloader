@@ -1,27 +1,50 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use chrono::{DateTime, Datelike, NaiveDateTime, Timelike};
-use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Rounding, Stroke, Vec2};
+use eframe::egui::{
+    self, Color32, FontFamily, FontId, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke, Vec2,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::env;
+use std::fs;
 use std::io::{BufRead, BufReader};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const AWS_ID: &str = "196233775518";
 const VIDDASTRAGE_PROXY: &str = "https://cors.viddastrage.workers.dev/corsproxy/?apiurl=";
+const CORS_LOL_PROXY: &str = "https://api.cors.lol/?url=";
 const PREFIXES_URL: &str =
     "https://raw.githubusercontent.com/mortyobnoxious/kickvod-extractor/refs/heads/main/prefixes.json";
+const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const MAX_TERMINAL_LOGS: usize = 1500;
 
-// Pixel art grid matching /public/assets/aistudio/Gemini_Generated_Image_z2ceqoz2ceqoz2ce__1__ef8ae8c7.png
+// Refined pure-black palette with 60-30-10 discipline
+const BG_CANVAS: Color32 = Color32::BLACK; // #000000
+const BG_SURFACE: Color32 = Color32::from_rgb(13, 14, 16); // #0D0E10
+const BG_ELEVATED: Color32 = Color32::from_rgb(21, 23, 26); // #15171A
+const BORDER_SUBTLE: Color32 = Color32::from_rgb(31, 35, 40); // #1F2328
+const BORDER_HOVER: Color32 = Color32::from_rgb(46, 52, 60); // #2E343C
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(244, 246, 248); // #F4F6F8
+const TEXT_MUTED: Color32 = Color32::from_rgb(139, 148, 158); // #8B949E
+const ACCENT_GREEN: Color32 = Color32::from_rgb(0, 231, 1); // #00E701
+const ACCENT_TINT: Color32 = Color32::from_rgb(0, 22, 3); // Subtle active green tint
+const ACCENT_HOVER_BG: Color32 = Color32::from_rgb(6, 26, 8);
+const STATUS_FAILED: Color32 = Color32::from_rgb(248, 113, 113); // #F87171
+const STATUS_CANCELED: Color32 = Color32::from_rgb(251, 191, 36); // #FBBF24
+
+// Window icon grid (used once at startup for OS taskbar/titlebar icon)
 const ICON_5_GRID: [&str; 18] = [
     "################",
     "################",
@@ -43,109 +66,7 @@ const ICON_5_GRID: [&str; 18] = [
     "..############..",
 ];
 
-// Pixel art grids matching the 4 uploaded tab icons in /public/assets/aistudio/
-const ICON_DOWNLOADS_GRID: [&str; 22] = [
-    "......................",
-    "......................",
-    "......................",
-    "........######........",
-    "......................",
-    "........######........",
-    "........######........",
-    "........######........",
-    "........######........",
-    ".....############.....",
-    "......##########......",
-    ".......########.......",
-    "........######........",
-    ".........####.........",
-    "...##.....##.....##...",
-    "...##............##...",
-    "...################...",
-    "....##############....",
-    "......................",
-    "......................",
-    "......................",
-    "......................",
-];
-
-const ICON_TERMINAL_GRID: [&str; 22] = [
-    "......................",
-    "......................",
-    "......................",
-    "....##############....",
-    "...################...",
-    "...##............##...",
-    "...##.##.........##...",
-    "...##.###........##...",
-    "...##..###.......##...",
-    "...##...###......##...",
-    "...##....##......##...",
-    "...##...###......##...",
-    "...##..###.......##...",
-    "...##.###........##...",
-    "...##.##...#####.##...",
-    "...##......#####.##...",
-    "...##............##...",
-    "...################...",
-    "....##############....",
-    "......................",
-    "......................",
-    "......................",
-];
-
-const ICON_COMPLETED_GRID: [&str; 22] = [
-    "......................",
-    "......................",
-    "......................",
-    "........######........",
-    ".....####....####.....",
-    "....###........###....",
-    "...##............##...",
-    "...##.........##.##...",
-    "..##.........####.##..",
-    "..##........####..##..",
-    "..##..###..####...##..",
-    "..##..########....##..",
-    "..##...######.....##..",
-    "...##...####.....##...",
-    "...##....##......##...",
-    "....###........###....",
-    ".....####....####.....",
-    "........######........",
-    "......................",
-    "......................",
-    "......................",
-    "......................",
-];
-
-const ICON_ABOUT_GRID: [&str; 22] = [
-    "......................",
-    "......................",
-    "........######........",
-    "......##########......",
-    ".....###......###.....",
-    "....##..........##....",
-    "...##.....##.....##...",
-    "...##.....##.....##...",
-    "..##..............##..",
-    "..##.....###......##..",
-    "..##......##......##..",
-    "..##......##......##..",
-    "..##......##......##..",
-    "..###.....##.....###..",
-    "...##....####....##...",
-    "....##...####...##....",
-    ".....###......###.....",
-    "......##########......",
-    "........######........",
-    "......................",
-    "......................",
-    "......................",
-];
-
-
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Downloads,
     Terminal,
@@ -153,7 +74,7 @@ enum Tab {
     About,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum Resolution {
     R1080p60,
     R1080p,
@@ -165,7 +86,17 @@ enum Resolution {
 }
 
 impl Resolution {
-    fn label(&self) -> &'static str {
+    const ALL: [Resolution; 7] = [
+        Resolution::R1080p60,
+        Resolution::R1080p,
+        Resolution::R720p60,
+        Resolution::R720p,
+        Resolution::R480p,
+        Resolution::R360p,
+        Resolution::AudioOnly,
+    ];
+
+    fn label(self) -> &'static str {
         match self {
             Resolution::R1080p60 => "1080p60 (Source)",
             Resolution::R1080p => "1080p",
@@ -177,7 +108,7 @@ impl Resolution {
         }
     }
 
-    fn short_label(&self) -> &'static str {
+    fn short_label(self) -> &'static str {
         match self {
             Resolution::R1080p60 => "1080p60",
             Resolution::R1080p => "1080p",
@@ -189,7 +120,19 @@ impl Resolution {
         }
     }
 
-    fn ytdlp_format(&self) -> &'static str {
+    fn from_short_label(s: &str) -> Self {
+        match s {
+            "1080p" => Resolution::R1080p,
+            "720p60" => Resolution::R720p60,
+            "720p" => Resolution::R720p,
+            "480p" => Resolution::R480p,
+            "360p" => Resolution::R360p,
+            "Audio" => Resolution::AudioOnly,
+            _ => Resolution::R1080p60,
+        }
+    }
+
+    fn ytdlp_format(self) -> &'static str {
         match self {
             Resolution::R1080p60 => {
                 "bestvideo[height<=1080][fps<=60]+bestaudio/best[height<=1080][fps<=60]/best"
@@ -206,7 +149,7 @@ impl Resolution {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum ContainerExt {
     Mkv,
     Mp4,
@@ -214,12 +157,124 @@ enum ContainerExt {
 }
 
 impl ContainerExt {
-    fn as_str(&self) -> &'static str {
+    const ALL: [ContainerExt; 3] = [ContainerExt::Mkv, ContainerExt::Mp4, ContainerExt::Ts];
+
+    fn as_str(self) -> &'static str {
         match self {
             ContainerExt::Mkv => "mkv",
             ContainerExt::Mp4 => "mp4",
             ContainerExt::Ts => "ts",
         }
+    }
+
+    fn dot_upper(self) -> &'static str {
+        match self {
+            ContainerExt::Mkv => ".MKV",
+            ContainerExt::Mp4 => ".MP4",
+            ContainerExt::Ts => ".TS",
+        }
+    }
+
+    fn upper(self) -> &'static str {
+        match self {
+            ContainerExt::Mkv => "MKV",
+            ContainerExt::Mp4 => "MP4",
+            ContainerExt::Ts => "TS",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "mp4" => ContainerExt::Mp4,
+            "ts" => ContainerExt::Ts,
+            _ => ContainerExt::Mkv,
+        }
+    }
+}
+
+fn default_zoom_percent() -> u32 {
+    100
+}
+
+/// Persistent user configuration saved across app restarts.
+#[derive(Serialize, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    output_path: String,
+    #[serde(default = "default_zoom_percent")]
+    zoom_percent: u32,
+    #[serde(default)]
+    resolution: String,
+    #[serde(default)]
+    container_ext: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            output_path: String::new(),
+            zoom_percent: 100,
+            resolution: "1080p60".to_string(),
+            container_ext: "mkv".to_string(),
+        }
+    }
+}
+
+fn config_file_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = env::var_os("APPDATA").or_else(|| env::var_os("LOCALAPPDATA")) {
+            return Some(PathBuf::from(appdata).join("5KD").join("config.json"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = env::var_os("HOME") {
+            return Some(
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("5KD")
+                    .join("config.json"),
+            );
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(xdg).join("5kd").join("config.json"));
+        }
+        if let Some(home) = env::var_os("HOME") {
+            return Some(PathBuf::from(home).join(".config").join("5kd").join("config.json"));
+        }
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("5kd_config.json")))
+}
+
+fn load_app_config() -> AppConfig {
+    let Some(path) = config_file_path() else {
+        return AppConfig::default();
+    };
+    let Ok(bytes) = fs::read(&path) else {
+        return AppConfig::default();
+    };
+    let mut cfg: AppConfig = serde_json::from_slice(&bytes).unwrap_or_default();
+    cfg.output_path = cfg.output_path.trim().to_string();
+    cfg.zoom_percent = (cfg.zoom_percent.clamp(100, 150) / 10) * 10;
+    cfg
+}
+
+fn save_app_config(cfg: &AppConfig) {
+    let Some(path) = config_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(cfg) {
+        let _ = fs::write(path, json);
     }
 }
 
@@ -232,18 +287,45 @@ struct ExtractedVodMeta {
     source_type: String,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DownloadStatus {
+    Active,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl DownloadStatus {
+    fn label(self) -> &'static str {
+        match self {
+            DownloadStatus::Active => "Downloading",
+            DownloadStatus::Completed => "Completed",
+            DownloadStatus::Failed => "Failed",
+            DownloadStatus::Canceled => "Canceled",
+        }
+    }
+
+    fn color(self) -> Color32 {
+        match self {
+            DownloadStatus::Active | DownloadStatus::Completed => ACCENT_GREEN,
+            DownloadStatus::Failed => STATUS_FAILED,
+            DownloadStatus::Canceled => STATUS_CANCELED,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DownloadItem {
     id: usize,
     title: String,
     url: String,
     output_path: String,
-    resolution: String,
-    format: String,
+    saved_file_path: Option<String>,
+    resolution: &'static str,
+    format: &'static str,
     progress: f32,
     status_text: String,
-    is_completed: bool,
-    is_failed: bool,
+    status: DownloadStatus,
     cancel_flag: Arc<AtomicBool>,
     child_pid: Arc<Mutex<Option<u32>>>,
 }
@@ -252,18 +334,82 @@ enum WorkerEvent {
     Log(String),
     Extracted(usize, ExtractedVodMeta),
     Progress(usize, f32, String),
-    Finished(usize, bool, String),
+    Finished(usize, bool, String, Option<String>),
+}
+
+/// Event-driven UI wakeup handle: keeps idle CPU/GPU at 0% while throttling rapid worker output.
+#[derive(Clone)]
+struct UiNotifier {
+    ctx: egui::Context,
+    last_repaint: Arc<Mutex<Instant>>,
+}
+
+impl UiNotifier {
+    fn new(ctx: egui::Context) -> Self {
+        let initial = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        Self {
+            ctx,
+            last_repaint: Arc::new(Mutex::new(initial)),
+        }
+    }
+
+    fn wake_immediate(&self) {
+        if let Ok(mut guard) = self.last_repaint.lock() {
+            *guard = Instant::now();
+        }
+        self.ctx.request_repaint();
+    }
+
+    fn wake_throttled(&self) {
+        let min_interval = Duration::from_millis(50);
+        let should_now = if let Ok(mut guard) = self.last_repaint.lock() {
+            if guard.elapsed() >= min_interval {
+                *guard = Instant::now();
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if should_now {
+            self.ctx.request_repaint();
+        } else {
+            self.ctx.request_repaint_after(min_interval);
+        }
+    }
+}
+
+/// Shared connection-pooled HTTP client initialized once on first extraction.
+fn shared_http_client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .user_agent(CHROME_UA)
+                .timeout(Duration::from_secs(12))
+                .pool_max_idle_per_host(4)
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
 }
 
 fn encode_uri_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len() + 32);
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
             _ => {
-                out.push_str(&format!("%{:02X}", b));
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
             }
         }
     }
@@ -287,9 +433,6 @@ fn is_valid_kick_payload(val: &Value) -> bool {
         _ => false,
     }
 }
-
-const CORS_LOL_PROXY: &str = "https://api.cors.lol/?url=";
-const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 fn curl_fetch_text(url: &str) -> Option<String> {
     let mut cmd = Command::new("curl");
@@ -328,19 +471,14 @@ fn get_kick_json(
     target_url: &str,
     tx: Option<&Sender<WorkerEvent>>,
 ) -> Result<Value, String> {
+    let encoded = encode_uri_component(target_url);
     let candidates = [
-        (
-            "viddastrage",
-            format!("{}{}", VIDDASTRAGE_PROXY, encode_uri_component(target_url)),
-        ),
-        (
-            "cors.lol",
-            format!("{}{}", CORS_LOL_PROXY, encode_uri_component(target_url)),
-        ),
+        ("viddastrage", format!("{}{}", VIDDASTRAGE_PROXY, encoded)),
+        ("cors.lol", format!("{}{}", CORS_LOL_PROXY, encoded)),
         ("direct", target_url.to_string()),
     ];
 
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::with_capacity(3);
 
     for (label, candidate) in &candidates {
         match client
@@ -378,7 +516,7 @@ fn get_kick_json(
         }
     }
 
-    // Fallback to native curl (preinstalled on Windows 10/11, macOS, Linux) if reqwest hits TLS/proxy issues
+    // Fallback to native curl if reqwest hits TLS/Cloudflare edge filtering
     for (label, candidate) in &candidates {
         if let Some(body) = curl_fetch_text(candidate) {
             if let Ok(val) = serde_json::from_str::<Value>(&body) {
@@ -404,7 +542,11 @@ fn get_kick_json(
 }
 
 fn test_m3u8_url(client: &reqwest::blocking::Client, m3u8_url: &str) -> bool {
-    if let Ok(resp) = client.get(m3u8_url).send() {
+    if let Ok(resp) = client
+        .get(m3u8_url)
+        .header("Range", "bytes=0-511")
+        .send()
+    {
         if resp.status().is_success() {
             if let Ok(body) = resp.text() {
                 if body.contains("#EXTM3U") {
@@ -427,46 +569,132 @@ fn test_m3u8_url(client: &reqwest::blocking::Client, m3u8_url: &str) -> bool {
     false
 }
 
-fn parse_kick_utc(s: &str) -> Option<NaiveDateTime> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+/// Zero-dependency UTC timestamp parser replacing chrono.
+#[derive(Clone, Copy)]
+struct ParsedUtc {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    timestamp_ms: i64,
+}
+
+impl ParsedUtc {
+    fn ivs_time_path(self) -> String {
+        format!(
+            "{}/{}/{}/{}/{}",
+            self.year, self.month, self.day, self.hour, self.minute
+        )
+    }
+}
+
+/// Howard Hinnant's civil-to-days algorithm (days since Unix epoch 1970-01-01).
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = y as i64 - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// Parses Kick UTC strings like "2026-11-13 04:48:06" or "2026-11-13T04:48:07.000000Z".
+fn parse_kick_utc(s: &str) -> Option<ParsedUtc> {
+    let b = s.trim().as_bytes();
+    if b.len() < 19 {
         return None;
     }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Some(dt.naive_utc());
+    if b[4] != b'-' || b[7] != b'-' || (b[10] != b' ' && b[10] != b'T' && b[10] != b't') {
+        return None;
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
-        return Some(dt);
+    if b[13] != b':' || b[16] != b':' {
+        return None;
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.fZ") {
-        return Some(dt);
+    let year: i32 = std::str::from_utf8(&b[0..4]).ok()?.parse().ok()?;
+    let month: u32 = std::str::from_utf8(&b[5..7]).ok()?.parse().ok()?;
+    let day: u32 = std::str::from_utf8(&b[8..10]).ok()?.parse().ok()?;
+    let hour: u32 = std::str::from_utf8(&b[11..13]).ok()?.parse().ok()?;
+    let minute: u32 = std::str::from_utf8(&b[14..16]).ok()?.parse().ok()?;
+    let second: u32 = std::str::from_utf8(&b[17..19]).ok()?.parse().ok()?;
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%SZ") {
-        return Some(dt);
-    }
-    None
+
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + (hour as i64) * 3_600 + (minute as i64) * 60 + (second as i64);
+    Some(ParsedUtc {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        timestamp_ms: secs * 1000,
+    })
 }
 
-fn format_ivs_time_path(dt: &NaiveDateTime) -> String {
-    format!(
-        "{}/{}/{}/{}/{}",
-        dt.year(),
-        dt.month(),
-        dt.day(),
-        dt.hour(),
-        dt.minute()
-    )
-}
-
-fn extract_thumb_ids(thumb: &str) -> Option<(String, String)> {
-    if let Some(idx) = thumb.find("video_thumbnails/") {
-        let rest = &thumb[idx + "video_thumbnails/".len()..];
-        let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
+/// Extracts the 48-bit Unix millisecond timestamp from a UUIDv7 string without allocating.
+fn uuid_prefix_timestamp_ms(uuid: &str) -> i64 {
+    let mut acc: i64 = 0;
+    let mut digits = 0usize;
+    for b in uuid.bytes() {
+        if b == b'-' {
+            continue;
+        }
+        let val = match b {
+            b'0'..=b'9' => (b - b'0') as i64,
+            b'a'..=b'f' => (b - b'a' + 10) as i64,
+            b'A'..=b'F' => (b - b'A' + 10) as i64,
+            _ => return 0,
+        };
+        acc = (acc << 4) | val;
+        digits += 1;
+        if digits == 12 {
+            return acc;
         }
     }
-    None
+    0
+}
+
+fn extract_thumb_ids(thumb: &str) -> Option<(&str, &str)> {
+    let idx = thumb.find("video_thumbnails/")?;
+    let rest = &thumb[idx + "video_thumbnails/".len()..];
+    let mut parts = rest.split('/');
+    let session = parts.next().filter(|s| !s.is_empty())?;
+    let segment = parts.next().filter(|s| !s.is_empty())?;
+    Some((session, segment))
+}
+
+fn get_cached_prefixes(
+    client: &reqwest::blocking::Client,
+    tx: &Sender<WorkerEvent>,
+) -> Result<&'static [String], String> {
+    static CACHED_PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
+    if let Some(list) = CACHED_PREFIXES.get() {
+        return Ok(list.as_slice());
+    }
+    let _ = tx.send(WorkerEvent::Log(
+        "[extractor] Fetching CDN prefixes list from kickvod-extractor...".to_string(),
+    ));
+    let val = get_kick_json(client, PREFIXES_URL, Some(tx))?;
+    let mut parsed = Vec::new();
+    if let Some(arr) = val.as_array() {
+        parsed.reserve(arr.len());
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                parsed.push(s.to_string());
+            }
+        }
+    }
+    let _ = CACHED_PREFIXES.set(parsed);
+    Ok(CACHED_PREFIXES.get().map(|v| v.as_slice()).unwrap_or(&[]))
 }
 
 fn ytdlp_extract_kick_fallback(
@@ -537,7 +765,7 @@ fn ytdlp_extract_kick_fallback(
     })
 }
 
-/// Extracts Master M3U8 and metadata from a Kick VOD URL
+/// Extracts Master M3U8 and metadata from a Kick VOD URL.
 /// Full port of https://github.com/mortyobnoxious/kickvod-extractor
 fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<ExtractedVodMeta, String> {
     let trimmed = raw_url.trim();
@@ -551,25 +779,24 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
         });
     }
 
-    let mut user = String::new();
-    let mut uuid = String::new();
+    let mut user = "";
+    let mut uuid = "";
 
     if let Some(idx) = trimmed.find("kick.com/") {
         let rest = &trimmed[idx + "kick.com/".len()..];
-        let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() >= 3 && parts[1] == "videos" {
-            user = parts[0].to_string();
-            uuid = parts[2]
-                .split(&['?', '#'][..])
-                .next()
-                .unwrap_or("")
-                .to_string();
-        } else if parts.len() >= 2 && parts[0] == "video" {
-            uuid = parts[1]
-                .split(&['?', '#'][..])
-                .next()
-                .unwrap_or("")
-                .to_string();
+        let mut parts = rest.split('/');
+        if let (Some(p0), Some(p1)) = (parts.next(), parts.next()) {
+            if p1 == "videos" {
+                user = p0;
+                uuid = parts
+                    .next()
+                    .unwrap_or("")
+                    .split(&['?', '#'][..])
+                    .next()
+                    .unwrap_or("");
+            } else if p0 == "video" {
+                uuid = p1.split(&['?', '#'][..]).next().unwrap_or("");
+            }
         }
     }
 
@@ -582,15 +809,11 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
         );
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(CHROME_UA)
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = shared_http_client()?;
 
     // 1. Try v1/video/{uuid} first, then fallback to v2/channels/{user}/videos and v1/channels/{user}
     let v1_url = format!("https://kick.com/api/v1/video/{}", uuid);
-    let mut vod_obj: Option<Value> = get_kick_json(&client, &v1_url, None).ok();
+    let mut vod_obj: Option<Value> = get_kick_json(client, &v1_url, None).ok();
     let mut v2_matched_obj: Option<Value> = None;
     let mut api_err_opt: Option<String> = None;
 
@@ -602,12 +825,11 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
 
         let mut video_items: Vec<Value> = Vec::new();
         let v2_url = format!("https://kick.com/api/v2/channels/{}/videos", user);
-        match get_kick_json(&client, &v2_url, Some(tx)) {
-            Ok(v2_val) => {
-                if let Some(arr) = v2_val.as_array() {
-                    video_items = arr.clone();
-                }
+        match get_kick_json(client, &v2_url, Some(tx)) {
+            Ok(Value::Array(arr)) => {
+                video_items = arr;
             }
+            Ok(_) => {}
             Err(e) => {
                 api_err_opt = Some(e);
                 let _ = tx.send(WorkerEvent::Log(format!(
@@ -615,28 +837,27 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                     user
                 )));
                 let v1_ch_url = format!("https://kick.com/api/v1/channels/{}", user);
-                if let Ok(ch_val) = get_kick_json(&client, &v1_ch_url, Some(tx)) {
-                    if let Some(arr) = ch_val
-                        .get("previous_livestreams")
-                        .and_then(|p| p.as_array())
+                if let Ok(mut ch_val) = get_kick_json(client, &v1_ch_url, Some(tx)) {
+                    if let Some(Value::Array(arr)) = ch_val
+                        .as_object_mut()
+                        .and_then(|m| m.remove("previous_livestreams"))
                     {
-                        video_items = arr.clone();
+                        video_items = arr;
                     }
                 }
             }
         }
 
         if !video_items.is_empty() {
-            let hex_ts: String = uuid.chars().filter(|c| *c != '-').take(12).collect();
-            let uuid_time_ms = i64::from_str_radix(&hex_ts, 16).unwrap_or(0);
+            let uuid_time_ms = uuid_prefix_timestamp_ms(uuid);
 
-            for v in &video_items {
-                let vod_id_match = v.get("vod_id").and_then(|s| s.as_str()) == Some(&uuid);
+            for v in video_items {
+                let vod_id_match = v.get("vod_id").and_then(|s| s.as_str()) == Some(uuid);
                 let video_uuid_match = v
                     .get("video")
                     .and_then(|vid| vid.get("uuid"))
                     .and_then(|s| s.as_str())
-                    == Some(&uuid);
+                    == Some(uuid);
 
                 let time_match = if uuid_time_ms > 0 {
                     let date_str = v
@@ -647,8 +868,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                         .or_else(|| v.get("start_time").and_then(|s| s.as_str()))
                         .unwrap_or("");
                     if let Some(dt) = parse_kick_utc(date_str) {
-                        let video_time_ms = dt.and_utc().timestamp_millis();
-                        (video_time_ms - uuid_time_ms).abs() < 30_000
+                        (dt.timestamp_ms - uuid_time_ms).abs() < 30_000
                     } else {
                         false
                     }
@@ -657,7 +877,6 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                 };
 
                 if vod_id_match || video_uuid_match || time_match {
-                    v2_matched_obj = Some(v.clone());
                     let has_source = v
                         .get("source")
                         .and_then(|s| s.as_str())
@@ -670,11 +889,12 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                             .and_then(|s| s.as_str())
                         {
                             let inner_v1 = format!("https://kick.com/api/v1/video/{}", inner_uuid);
-                            if let Ok(v1_res) = get_kick_json(&client, &inner_v1, None) {
+                            if let Ok(v1_res) = get_kick_json(client, &inner_v1, None) {
                                 vod_obj = Some(v1_res);
                             }
                         }
                     }
+                    v2_matched_obj = Some(v);
                     break;
                 }
             }
@@ -697,7 +917,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
         .and_then(|l| l.get("channel"))
         .and_then(|c| c.get("slug"))
         .and_then(|s| s.as_str())
-        .unwrap_or(if user.is_empty() { "kick_vod" } else { &user })
+        .unwrap_or(if user.is_empty() { "kick_vod" } else { user })
         .to_string();
 
     let session_title = ls
@@ -763,7 +983,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
     let (session, segment) = extract_thumb_ids(thumb_str)
         .ok_or_else(|| "Thumbnail session/segment extraction failed".to_string())?;
 
-    let mut candidate_times: Vec<String> = Vec::new();
+    let mut candidate_paths: Vec<String> = Vec::with_capacity(4);
     for raw_ts in [
         ls.and_then(|l| l.get("start_time")).and_then(|s| s.as_str()),
         ls.and_then(|l| l.get("created_at")).and_then(|s| s.as_str()),
@@ -774,27 +994,29 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
     .flatten()
     {
         if let Some(dt) = parse_kick_utc(raw_ts) {
-            let formatted = format_ivs_time_path(&dt);
-            if !candidate_times.contains(&formatted) {
-                candidate_times.push(formatted);
+            let ivs_path = format!(
+                "ivs/v1/{}/{}/{}/{}/media/hls/master.m3u8",
+                AWS_ID,
+                session,
+                dt.ivs_time_path(),
+                segment
+            );
+            if !candidate_paths.contains(&ivs_path) {
+                candidate_paths.push(ivs_path);
             }
         }
     }
 
-    if candidate_times.is_empty() {
+    if candidate_paths.is_empty() {
         return Err("Could not parse VOD creation timestamp".to_string());
     }
 
     let _ = tx.send(WorkerEvent::Log(
         "[extractor] Testing direct AWS IVS stream URL...".to_string(),
     ));
-    for time_path in &candidate_times {
-        let ivs_path = format!(
-            "ivs/v1/{}/{}/{}/{}/media/hls/master.m3u8",
-            AWS_ID, session, time_path, segment
-        );
+    for ivs_path in &candidate_paths {
         let direct_url = format!("https://stream.kick.com/{}", ivs_path);
-        if test_m3u8_url(&client, &direct_url) {
+        if test_m3u8_url(client, &direct_url) {
             return Ok(ExtractedVodMeta {
                 m3u8_url: direct_url,
                 channel_slug,
@@ -805,33 +1027,22 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
         }
     }
 
-    let _ = tx.send(WorkerEvent::Log(
-        "[extractor] Fetching CDN prefixes list from kickvod-extractor...".to_string(),
-    ));
-    let prefixes_val = get_kick_json(&client, PREFIXES_URL, Some(tx))?;
-    if let Some(prefixes) = prefixes_val.as_array() {
-        for prefix_val in prefixes {
-            if let Some(prefix) = prefix_val.as_str() {
-                for time_path in &candidate_times {
-                    let ivs_path = format!(
-                        "ivs/v1/{}/{}/{}/{}/media/hls/master.m3u8",
-                        AWS_ID, session, time_path, segment
-                    );
-                    let candidate_url = if prefix.is_empty() {
-                        format!("https://stream.kick.com/{}", ivs_path)
-                    } else {
-                        format!("https://stream.kick.com/{}/{}", prefix, ivs_path)
-                    };
-                    if test_m3u8_url(&client, &candidate_url) {
-                        return Ok(ExtractedVodMeta {
-                            m3u8_url: candidate_url,
-                            channel_slug,
-                            session_title,
-                            duration_formatted,
-                            source_type: format!("Found with prefix: {}", prefix),
-                        });
-                    }
-                }
+    let prefixes = get_cached_prefixes(client, tx)?;
+    for prefix in prefixes {
+        for ivs_path in &candidate_paths {
+            let candidate_url = if prefix.is_empty() {
+                format!("https://stream.kick.com/{}", ivs_path)
+            } else {
+                format!("https://stream.kick.com/{}/{}", prefix, ivs_path)
+            };
+            if test_m3u8_url(client, &candidate_url) {
+                return Ok(ExtractedVodMeta {
+                    m3u8_url: candidate_url,
+                    channel_slug,
+                    session_title,
+                    duration_formatted,
+                    source_type: format!("Found with prefix: {}", prefix),
+                });
             }
         }
     }
@@ -839,127 +1050,326 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
     Err("No working M3U8 URL found with available prefixes".to_string())
 }
 
-fn draw_pixel_5_icon(ui: &mut egui::Ui, size: f32, accent_green: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(size, size), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 4.0, Color32::BLACK);
-    let cell_w = rect.width() / 20.0;
-    let cell_h = rect.height() / 22.0;
-    for (r, row) in ICON_5_GRID.iter().enumerate() {
-        for (c, ch) in row.chars().enumerate() {
-            if ch == '#' {
-                let px = rect.min.x + (c as f32 + 2.0) * cell_w;
-                let py = rect.min.y + (r as f32 + 2.0) * cell_h;
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(egui::pos2(px, py), Vec2::new(cell_w, cell_h)),
-                    0.0,
-                    accent_green,
-                );
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn open_output_folder(folder: &str, saved_file: Option<&str>) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(file) = saved_file {
+            if !file.is_empty() && Path::new(file).exists() {
+                let _ = Command::new("explorer")
+                    .arg(format!("/select,{}", file))
+                    .spawn();
+                return;
             }
+        }
+        if !folder.is_empty() {
+            let _ = Command::new("explorer").arg(folder).spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(file) = saved_file {
+            if !file.is_empty() && Path::new(file).exists() {
+                let _ = Command::new("open").args(["-R", file]).spawn();
+                return;
+            }
+        }
+        if !folder.is_empty() {
+            let _ = Command::new("open").arg(folder).spawn();
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let _ = saved_file;
+        if !folder.is_empty() {
+            let _ = Command::new("xdg-open").arg(folder).spawn();
         }
     }
 }
 
-fn draw_tab_icon(ui: &mut egui::Ui, tab: Tab, size: f32, accent_green: Color32) {
-    let grid: &[&str; 22] = match tab {
-        Tab::Downloads => &ICON_DOWNLOADS_GRID,
-        Tab::Terminal => &ICON_TERMINAL_GRID,
-        Tab::Completed => &ICON_COMPLETED_GRID,
-        Tab::About => &ICON_ABOUT_GRID,
-    };
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(size, size), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, Color32::BLACK);
-    let cell_w = rect.width() / 22.0;
-    let cell_h = rect.height() / 22.0;
-    for (r, row) in grid.iter().enumerate() {
-        for (c, ch) in row.chars().enumerate() {
-            if ch == '#' {
-                let px = rect.min.x + (c as f32) * cell_w;
-                let py = rect.min.y + (r as f32) * cell_h;
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(px, py),
-                        Vec2::new(cell_w.ceil(), cell_h.ceil()),
-                    ),
-                    0.0,
-                    accent_green,
-                );
-            }
+/// Lightweight geometric vector brand mark (5 primitives total instead of 288 pixel quads).
+fn draw_brand_mark(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(7.0), BG_SURFACE);
+    painter.rect_stroke(rect, Rounding::same(7.0), Stroke::new(1.25, ACCENT_GREEN));
+
+    let s = rect.width();
+    let ox = rect.min.x;
+    let oy = rect.min.y;
+    let stroke = Stroke::new((s * 0.105).max(2.0), ACCENT_GREEN);
+
+    let pts = vec![
+        Pos2::new(ox + s * 0.69, oy + s * 0.27),
+        Pos2::new(ox + s * 0.34, oy + s * 0.27),
+        Pos2::new(ox + s * 0.34, oy + s * 0.49),
+        Pos2::new(ox + s * 0.61, oy + s * 0.49),
+        Pos2::new(ox + s * 0.69, oy + s * 0.56),
+        Pos2::new(ox + s * 0.69, oy + s * 0.68),
+        Pos2::new(ox + s * 0.61, oy + s * 0.74),
+        Pos2::new(ox + s * 0.33, oy + s * 0.74),
+    ];
+    painter.add(Shape::line(pts, stroke));
+}
+
+/// Lightweight modern geometric vector icons for sidebar navigation (2–4 primitives each).
+fn draw_nav_icon(ui: &mut egui::Ui, tab: Tab, size: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let painter = ui.painter();
+    let s = rect.width();
+    let ox = rect.min.x;
+    let oy = rect.min.y;
+    let stroke = Stroke::new(1.6, color);
+
+    match tab {
+        Tab::Downloads => {
+            painter.line_segment(
+                [
+                    Pos2::new(ox + s * 0.50, oy + s * 0.16),
+                    Pos2::new(ox + s * 0.50, oy + s * 0.62),
+                ],
+                stroke,
+            );
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(ox + s * 0.31, oy + s * 0.44),
+                    Pos2::new(ox + s * 0.50, oy + s * 0.64),
+                    Pos2::new(ox + s * 0.69, oy + s * 0.44),
+                ],
+                stroke,
+            ));
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(ox + s * 0.18, oy + s * 0.68),
+                    Pos2::new(ox + s * 0.18, oy + s * 0.84),
+                    Pos2::new(ox + s * 0.82, oy + s * 0.84),
+                    Pos2::new(ox + s * 0.82, oy + s * 0.68),
+                ],
+                stroke,
+            ));
+        }
+        Tab::Terminal => {
+            let box_rect = Rect::from_min_max(
+                Pos2::new(ox + s * 0.12, oy + s * 0.18),
+                Pos2::new(ox + s * 0.88, oy + s * 0.82),
+            );
+            painter.rect_stroke(box_rect, Rounding::same(3.0), stroke);
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(ox + s * 0.28, oy + s * 0.38),
+                    Pos2::new(ox + s * 0.44, oy + s * 0.50),
+                    Pos2::new(ox + s * 0.28, oy + s * 0.62),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [
+                    Pos2::new(ox + s * 0.52, oy + s * 0.62),
+                    Pos2::new(ox + s * 0.72, oy + s * 0.62),
+                ],
+                stroke,
+            );
+        }
+        Tab::Completed => {
+            let center = rect.center();
+            painter.circle_stroke(center, s * 0.38, stroke);
+            painter.add(Shape::line(
+                vec![
+                    Pos2::new(ox + s * 0.33, oy + s * 0.51),
+                    Pos2::new(ox + s * 0.45, oy + s * 0.63),
+                    Pos2::new(ox + s * 0.69, oy + s * 0.39),
+                ],
+                stroke,
+            ));
+        }
+        Tab::About => {
+            let center = rect.center();
+            painter.circle_stroke(center, s * 0.38, stroke);
+            painter.circle_filled(Pos2::new(ox + s * 0.50, oy + s * 0.34), s * 0.06, color);
+            painter.line_segment(
+                [
+                    Pos2::new(ox + s * 0.50, oy + s * 0.47),
+                    Pos2::new(ox + s * 0.50, oy + s * 0.69),
+                ],
+                stroke,
+            );
         }
     }
+}
+
+/// Sleek 8px progress bar with high-contrast right-aligned tabular percentage.
+fn draw_progress_row(ui: &mut egui::Ui, progress: f32) {
+    let clamped = progress.clamp(0.0, 1.0);
+    let pct = (clamped * 100.0).round() as u32;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(
+            RichText::new(format!("{:>3}%", pct))
+                .size(12.0)
+                .family(FontFamily::Monospace)
+                .strong()
+                .color(TEXT_PRIMARY),
+        );
+        ui.add_space(10.0);
+        let track_w = ui.available_width().max(40.0);
+        let (track_rect, _) = ui.allocate_exact_size(Vec2::new(track_w, 8.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(track_rect, Rounding::same(4.0), BG_ELEVATED);
+        painter.rect_stroke(track_rect, Rounding::same(4.0), Stroke::new(1.0, BORDER_SUBTLE));
+
+        let fill_w = (track_rect.width() * clamped).max(if clamped > 0.0 { 6.0 } else { 0.0 });
+        if fill_w > 0.0 {
+            let fill_rect =
+                Rect::from_min_size(track_rect.min, Vec2::new(fill_w, track_rect.height()));
+            painter.rect_filled(fill_rect, Rounding::same(4.0), ACCENT_GREEN);
+        }
+    });
+}
+
+fn styled_secondary_btn(
+    label: &str,
+    text_color: Color32,
+    border: Color32,
+    min_size: Vec2,
+) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).size(12.5).strong().color(text_color))
+        .fill(BG_ELEVATED)
+        .stroke(Stroke::new(1.0, border))
+        .rounding(Rounding::same(7.0))
+        .min_size(min_size)
 }
 
 struct FiveKdApp {
     current_tab: Tab,
-    zoom_percent: u32, // 100 to 150
+    zoom_percent: u32,         // 100 to 150
+    applied_zoom_percent: u32, // Avoids redundant set_zoom_factor calls every frame
     url_input: String,
     start_time: String,
     end_time: String,
     resolution: Resolution,
     container_ext: ContainerExt,
     output_path: String,
+    paste_notice: Option<(String, Instant)>,
 
     active_downloads: Vec<DownloadItem>,
     completed_downloads: Vec<DownloadItem>,
-    terminal_logs: Vec<String>,
+    terminal_logs: VecDeque<String>,
     next_id: usize,
 
     tx: Sender<WorkerEvent>,
     rx: Receiver<WorkerEvent>,
+    notifier: UiNotifier,
 }
 
 impl FiveKdApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // #00e701 -> RGB(0, 231, 1)
-        let accent_green = Color32::from_rgb(0, 231, 1);
-
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(0, 0, 0); // Pure black #000000
-        visuals.window_fill = Color32::from_rgb(0, 0, 0); // Pure black popup menu background
-        visuals.window_stroke = Stroke::new(1.5, accent_green); // #00e701 popup menu border
-        visuals.extreme_bg_color = Color32::from_rgb(16, 16, 16);
-        visuals.selection.bg_fill = Color32::BLACK;
-        visuals.selection.stroke = Stroke::new(1.5, accent_green);
-        visuals.hyperlink_color = accent_green;
+        visuals.panel_fill = BG_CANVAS;
+        visuals.window_fill = BG_SURFACE;
+        visuals.window_stroke = Stroke::new(1.0, BORDER_HOVER);
+        visuals.window_rounding = Rounding::same(8.0);
+        visuals.extreme_bg_color = BG_ELEVATED;
+        visuals.faint_bg_color = BG_SURFACE;
+        visuals.selection.bg_fill = ACCENT_TINT;
+        visuals.selection.stroke = Stroke::new(1.25, ACCENT_GREEN);
+        visuals.hyperlink_color = ACCENT_GREEN;
+        visuals.override_text_color = Some(TEXT_PRIMARY);
 
-        // Use #000000 background and #00e701 accent around interactive widgets and popup menus
-        visuals.widgets.inactive.bg_fill = Color32::BLACK;
-        visuals.widgets.inactive.weak_bg_fill = Color32::BLACK;
-        visuals.widgets.hovered.bg_fill = Color32::BLACK;
-        visuals.widgets.hovered.weak_bg_fill = Color32::BLACK;
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.5, accent_green);
-        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, accent_green);
-        visuals.widgets.active.bg_fill = Color32::BLACK;
-        visuals.widgets.active.weak_bg_fill = Color32::BLACK;
-        visuals.widgets.active.bg_stroke = Stroke::new(1.5, accent_green);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.0, accent_green);
-        visuals.widgets.open.bg_fill = Color32::BLACK;
-        visuals.widgets.open.weak_bg_fill = Color32::BLACK;
-        visuals.widgets.open.bg_stroke = Stroke::new(1.5, accent_green);
-        visuals.widgets.open.fg_stroke = Stroke::new(1.0, accent_green);
+        // Calm, modern interactive widget states
+        visuals.widgets.noninteractive.bg_fill = BG_SURFACE;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
+        visuals.widgets.noninteractive.rounding = Rounding::same(6.0);
+
+        visuals.widgets.inactive.bg_fill = BG_ELEVATED;
+        visuals.widgets.inactive.weak_bg_fill = BG_ELEVATED;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.inactive.rounding = Rounding::same(6.0);
+
+        visuals.widgets.hovered.bg_fill = BG_ELEVATED;
+        visuals.widgets.hovered.weak_bg_fill = BG_ELEVATED;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_GREEN);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.hovered.rounding = Rounding::same(6.0);
+
+        visuals.widgets.active.bg_fill = ACCENT_HOVER_BG;
+        visuals.widgets.active.weak_bg_fill = ACCENT_HOVER_BG;
+        visuals.widgets.active.bg_stroke = Stroke::new(1.25, ACCENT_GREEN);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, ACCENT_GREEN);
+        visuals.widgets.active.rounding = Rounding::same(6.0);
+
+        visuals.widgets.open.bg_fill = BG_ELEVATED;
+        visuals.widgets.open.weak_bg_fill = BG_ELEVATED;
+        visuals.widgets.open.bg_stroke = Stroke::new(1.25, ACCENT_GREEN);
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, ACCENT_GREEN);
+        visuals.widgets.open.rounding = Rounding::same(6.0);
 
         cc.egui_ctx.set_visuals(visuals);
+        cc.egui_ctx.style_mut(|style| {
+            style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+            style.spacing.button_padding = Vec2::new(12.0, 6.0);
+            style.spacing.scroll.bar_width = 6.0;
+        });
 
+        let cfg = load_app_config();
         let (tx, rx) = channel();
+        let notifier = UiNotifier::new(cc.egui_ctx.clone());
+
+        let mut logs = VecDeque::with_capacity(64);
+        logs.push_back("[info] 5KD - 5wi's Kick Downloader initialized.".to_string());
+        logs.push_back("[info] Integrated Kick VOD Extractor ready.".to_string());
+        if !cfg.output_path.is_empty() {
+            logs.push_back(format!(
+                "[config] Restored output destination: {}",
+                cfg.output_path
+            ));
+        }
 
         Self {
             current_tab: Tab::Downloads,
-            zoom_percent: 100,
+            zoom_percent: cfg.zoom_percent,
+            applied_zoom_percent: 0, // Applies saved zoom_percent on the very first frame
             url_input: String::new(),
             start_time: String::new(),
             end_time: String::new(),
-            resolution: Resolution::R1080p60,
-            container_ext: ContainerExt::Mkv,
-            output_path: String::new(),
+            resolution: Resolution::from_short_label(&cfg.resolution),
+            container_ext: ContainerExt::from_str(&cfg.container_ext),
+            output_path: cfg.output_path,
+            paste_notice: None,
             active_downloads: Vec::new(),
             completed_downloads: Vec::new(),
-            terminal_logs: vec![
-                "[info] 5KD - 5wi's Kick Downloader (Native Rust Engine) initialized.".to_string(),
-                "[info] Integrated Kick VOD Extractor ready.".to_string(),
-            ],
+            terminal_logs: logs,
             next_id: 1,
             tx,
             rx,
+            notifier,
         }
+    }
+
+    fn persist_config(&self) {
+        save_app_config(&AppConfig {
+            output_path: self.output_path.clone(),
+            zoom_percent: self.zoom_percent,
+            resolution: self.resolution.short_label().to_string(),
+            container_ext: self.container_ext.as_str().to_string(),
+        });
+    }
+
+    fn push_log(&mut self, line: String) {
+        if self.terminal_logs.len() >= MAX_TERMINAL_LOGS {
+            self.terminal_logs.pop_front();
+        }
+        self.terminal_logs.push_back(line);
     }
 
     fn has_chosen_folder(&self) -> bool {
@@ -973,10 +1383,11 @@ impl FiveKdApp {
 
             if let Ok(guard) = item.child_pid.lock() {
                 if let Some(pid) = *guard {
+                    let pid_str = pid.to_string();
                     #[cfg(target_os = "windows")]
                     {
                         let _ = Command::new("taskkill")
-                            .args(["/F", "/T", "/PID", &pid.to_string()])
+                            .args(["/F", "/T", "/PID", &pid_str])
                             .creation_flags(CREATE_NO_WINDOW)
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
@@ -986,7 +1397,7 @@ impl FiveKdApp {
                     #[cfg(not(target_os = "windows"))]
                     {
                         let _ = Command::new("kill")
-                            .args(["-9", &pid.to_string()])
+                            .args(["-9", &pid_str])
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .spawn();
@@ -994,12 +1405,11 @@ impl FiveKdApp {
                 }
             }
 
-            self.terminal_logs.push(format!(
+            self.push_log(format!(
                 "[cancel] Download #{} canceled by user: {}",
                 id, item.title
             ));
-            item.is_completed = false;
-            item.is_failed = true;
+            item.status = DownloadStatus::Canceled;
             item.status_text = "Canceled by user".to_string();
             self.completed_downloads.insert(0, item);
         }
@@ -1025,15 +1435,15 @@ impl FiveKdApp {
 
         let item = DownloadItem {
             id,
-            title: format!("Extracting VOD: {}...", raw_url),
+            title: format!("Extracting VOD: {}", raw_url),
             url: raw_url.clone(),
             output_path: custom_out.clone(),
-            resolution: res.short_label().to_string(),
-            format: ext.as_str().to_uppercase(),
+            saved_file_path: None,
+            resolution: res.short_label(),
+            format: ext.upper(),
             progress: 0.02,
             status_text: "Extracting Master M3U8 URL from Kick...".to_string(),
-            is_completed: false,
-            is_failed: false,
+            status: DownloadStatus::Active,
             cancel_flag: cancel_flag.clone(),
             child_pid: child_pid.clone(),
         };
@@ -1042,11 +1452,13 @@ impl FiveKdApp {
         self.url_input.clear();
 
         let tx = self.tx.clone();
+        let notifier = self.notifier.clone();
         thread::spawn(move || {
             let _ = tx.send(WorkerEvent::Log(format!(
                 "[extractor] Analyzing URL: {}",
                 raw_url
             )));
+            notifier.wake_immediate();
 
             let extracted = match extract_kick_vod(&raw_url, &tx) {
                 Ok(meta) => {
@@ -1058,17 +1470,16 @@ impl FiveKdApp {
                         meta.source_type, meta.m3u8_url
                     )));
                     let _ = tx.send(WorkerEvent::Extracted(id, meta.clone()));
+                    notifier.wake_immediate();
                     meta
                 }
                 Err(e) => {
                     if cancel_flag.load(Ordering::SeqCst) {
                         return;
                     }
-                    let _ = tx.send(WorkerEvent::Log(format!(
-                        "[extractor error] {}",
-                        e
-                    )));
-                    let _ = tx.send(WorkerEvent::Finished(id, false, e));
+                    let _ = tx.send(WorkerEvent::Log(format!("[extractor error] {}", e)));
+                    let _ = tx.send(WorkerEvent::Finished(id, false, e, None));
+                    notifier.wake_immediate();
                     return;
                 }
             };
@@ -1086,33 +1497,47 @@ impl FiveKdApp {
             {
                 custom_out
             } else {
-                format!("{}\\{}", custom_out, default_filename)
+                #[cfg(target_os = "windows")]
+                {
+                    format!("{}\\{}", custom_out, default_filename)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    format!("{}/{}", custom_out, default_filename)
+                }
             };
 
             let mut cmd = Command::new("yt-dlp");
-            cmd.arg("-f")
-                .arg(res.ytdlp_format())
-                .arg("-N")
-                .arg("8")
-                .arg("--user-agent")
-                .arg("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-                .arg("--add-header")
-                .arg("Origin:https://kick.com")
-                .arg("--add-header")
-                .arg("Referer:https://kick.com/")
-                .arg("--downloader")
-                .arg("ffmpeg");
+            cmd.args([
+                "-f",
+                res.ytdlp_format(),
+                "-N",
+                "8",
+                "--user-agent",
+                CHROME_UA,
+                "--add-header",
+                "Origin:https://kick.com",
+                "--add-header",
+                "Referer:https://kick.com/",
+                "--downloader",
+                "ffmpeg",
+            ]);
 
-            let mut time_args = Vec::new();
-            if !start_t.is_empty() {
-                time_args.push(format!("-ss {}", start_t));
-            }
-            if !end_t.is_empty() {
-                time_args.push(format!("-to {}", end_t));
-            }
-            if !time_args.is_empty() {
-                cmd.arg("--downloader-args")
-                    .arg(format!("ffmpeg_i:{}", time_args.join(" ")));
+            if !start_t.is_empty() || !end_t.is_empty() {
+                let mut ff_args = String::with_capacity(40);
+                ff_args.push_str("ffmpeg_i:");
+                if !start_t.is_empty() {
+                    ff_args.push_str("-ss ");
+                    ff_args.push_str(&start_t);
+                }
+                if !end_t.is_empty() {
+                    if !start_t.is_empty() {
+                        ff_args.push(' ');
+                    }
+                    ff_args.push_str("-to ");
+                    ff_args.push_str(&end_t);
+                }
+                cmd.arg("--downloader-args").arg(ff_args);
             }
 
             cmd.arg("-o")
@@ -1129,6 +1554,7 @@ impl FiveKdApp {
                 ">>> Executing yt-dlp -> {}",
                 final_output
             )));
+            notifier.wake_immediate();
 
             match cmd.spawn() {
                 Ok(mut child) => {
@@ -1143,16 +1569,25 @@ impl FiveKdApp {
                     if let Some(stderr) = child.stderr.take() {
                         let tx_err = tx.clone();
                         let cancel_err = cancel_flag.clone();
+                        let notifier_err = notifier.clone();
                         thread::spawn(move || {
                             let reader = BufReader::new(stderr);
+                            let mut last_prog = Instant::now()
+                                .checked_sub(Duration::from_secs(1))
+                                .unwrap_or_else(Instant::now);
                             for line in reader.lines().flatten() {
                                 if cancel_err.load(Ordering::SeqCst) {
                                     break;
                                 }
-                                let _ = tx_err.send(WorkerEvent::Log(line.clone()));
-                                if line.contains("frame=") || line.contains("time=") {
-                                    let _ = tx_err.send(WorkerEvent::Progress(id, 0.5, line));
+                                if (line.contains("frame=") || line.contains("time="))
+                                    && last_prog.elapsed() >= Duration::from_millis(80)
+                                {
+                                    last_prog = Instant::now();
+                                    let _ =
+                                        tx_err.send(WorkerEvent::Progress(id, 0.5, line.clone()));
                                 }
+                                let _ = tx_err.send(WorkerEvent::Log(line));
+                                notifier_err.wake_throttled();
                             }
                         });
                     }
@@ -1163,7 +1598,6 @@ impl FiveKdApp {
                             if cancel_flag.load(Ordering::SeqCst) {
                                 break;
                             }
-                            let _ = tx.send(WorkerEvent::Log(line.clone()));
                             if let Some(pct_idx) = line.find('%') {
                                 let before = &line[..pct_idx];
                                 if let Some(num_str) = before.split_whitespace().last() {
@@ -1176,6 +1610,8 @@ impl FiveKdApp {
                                     }
                                 }
                             }
+                            let _ = tx.send(WorkerEvent::Log(line));
+                            notifier.wake_throttled();
                         }
                     }
 
@@ -1189,6 +1625,7 @@ impl FiveKdApp {
                                 id,
                                 true,
                                 format!("Saved to {}", final_output),
+                                Some(final_output),
                             ));
                         }
                         Ok(s) => {
@@ -1196,12 +1633,14 @@ impl FiveKdApp {
                                 id,
                                 false,
                                 format!("yt-dlp exited with code {:?}", s.code()),
+                                None,
                             ));
                         }
                         Err(e) => {
-                            let _ = tx.send(WorkerEvent::Finished(id, false, e.to_string()));
+                            let _ = tx.send(WorkerEvent::Finished(id, false, e.to_string(), None));
                         }
                     }
+                    notifier.wake_immediate();
                 }
                 Err(e) => {
                     if cancel_flag.load(Ordering::SeqCst) {
@@ -1215,7 +1654,9 @@ impl FiveKdApp {
                         id,
                         false,
                         "yt-dlp or ffmpeg not found in PATH".to_string(),
+                        None,
                     ));
+                    notifier.wake_immediate();
                 }
             }
         });
@@ -1225,7 +1666,7 @@ impl FiveKdApp {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 WorkerEvent::Log(line) => {
-                    self.terminal_logs.push(line);
+                    self.push_log(line);
                 }
                 WorkerEvent::Extracted(id, meta) => {
                     if let Some(item) = self.active_downloads.iter_mut().find(|i| i.id == id) {
@@ -1245,12 +1686,16 @@ impl FiveKdApp {
                         item.status_text = status;
                     }
                 }
-                WorkerEvent::Finished(id, success, msg) => {
+                WorkerEvent::Finished(id, success, msg, saved_path) => {
                     if let Some(pos) = self.active_downloads.iter().position(|i| i.id == id) {
                         let mut item = self.active_downloads.remove(pos);
                         item.progress = if success { 1.0 } else { item.progress };
-                        item.is_completed = success;
-                        item.is_failed = !success;
+                        item.status = if success {
+                            DownloadStatus::Completed
+                        } else {
+                            DownloadStatus::Failed
+                        };
+                        item.saved_file_path = saved_path;
                         item.status_text = msg;
                         self.completed_downloads.insert(0, item);
                     }
@@ -1258,831 +1703,949 @@ impl FiveKdApp {
             }
         }
     }
+
+    fn render_history_card(&self, ui: &mut egui::Ui, item: &DownloadItem) {
+        egui::Frame::none()
+            .fill(BG_SURFACE)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !item.output_path.is_empty() && item.status == DownloadStatus::Completed {
+                        let open_btn = styled_secondary_btn(
+                            "Open Folder",
+                            TEXT_PRIMARY,
+                            BORDER_HOVER,
+                            Vec2::new(96.0, 30.0),
+                        );
+                        if ui.add(open_btn).clicked() {
+                            open_output_folder(&item.output_path, item.saved_file_path.as_deref());
+                        }
+                        ui.add_space(12.0);
+                    }
+
+                    let rem_w = ui.available_width().max(80.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(rem_w, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.label(
+                                RichText::new(&item.title)
+                                    .size(13.5)
+                                    .strong()
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.add_space(3.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    RichText::new(item.status.label())
+                                        .size(12.0)
+                                        .strong()
+                                        .color(item.status.color()),
+                                );
+                                ui.label(RichText::new("·").size(12.0).color(TEXT_MUTED));
+                                ui.label(
+                                    RichText::new(format!("{} · {}", item.resolution, item.format))
+                                        .size(11.5)
+                                        .family(FontFamily::Monospace)
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.label(RichText::new("·").size(12.0).color(TEXT_MUTED));
+                                ui.label(
+                                    RichText::new(&item.status_text)
+                                        .size(11.5)
+                                        .family(FontFamily::Monospace)
+                                        .color(TEXT_MUTED),
+                                );
+                            });
+                        },
+                    );
+                });
+            });
+    }
 }
 
 impl eframe::App for FiveKdApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_config();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
-        ctx.set_zoom_factor(self.zoom_percent as f32 / 100.0);
-        ctx.request_repaint_after(std::time::Duration::from_millis(120));
 
-        // #00e701 -> RGB(0, 231, 1)
-        let accent_green = Color32::from_rgb(0, 231, 1);
-        let sidebar_bg = Color32::BLACK; // Pure black #000000
-        let card_bg = Color32::from_rgb(26, 26, 26);     // #1a1a1a
-        let input_bg = Color32::from_rgb(16, 16, 16);    // #101010
-        let border_col = Color32::from_rgb(42, 42, 42);  // #2a2a2a
-        let muted_text = Color32::from_rgb(155, 160, 165);
+        // Only mutate zoom factor when user changes zoom (zero overhead on steady frames)
+        if self.zoom_percent != self.applied_zoom_percent {
+            ctx.set_zoom_factor(self.zoom_percent as f32 / 100.0);
+            self.applied_zoom_percent = self.zoom_percent;
+        }
 
-        // Top Bar with Zoom In/Out Buttons (100% to 150%)
-        egui::TopBottomPanel::top("top_bar")
+        // Expire transient paste feedback cleanly without continuous polling
+        if let Some((_, created_at)) = &self.paste_notice {
+            if created_at.elapsed() >= Duration::from_secs(2) {
+                self.paste_notice = None;
+            }
+        }
+
+        // Left Navigation Rail (#000000 with subtle hairline divider & footer zoom controls)
+        egui::SidePanel::left("sidebar")
+            .resizable(false)
+            .exact_width(214.0)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(12, 12, 12))
-                    .inner_margin(egui::Margin::symmetric(14.0, 7.0))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(31, 31, 31))),
+                    .fill(BG_CANVAS)
+                    .inner_margin(egui::Margin::symmetric(14.0, 18.0))
+                    .stroke(Stroke::new(1.0, BORDER_SUBTLE)),
             )
             .show(ctx, |ui| {
+                // Header Brand Block (single source of branding — no redundant top bar)
                 ui.horizontal(|ui| {
-                    draw_pixel_5_icon(ui, 18.0, accent_green);
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("5KD - 5wi's Kick Downloader")
-                            .size(12.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Zoom In (+) up to 150%
-                        let zoom_in_btn = egui::Button::new(
-                            RichText::new("+")
-                                .size(13.0)
-                                .family(FontFamily::Monospace)
-                                .strong()
-                                .color(if self.zoom_percent < 150 {
-                                    accent_green
-                                } else {
-                                    muted_text
-                                }),
-                        )
-                        .fill(Color32::BLACK)
-                        .stroke(Stroke::new(1.0, border_col))
-                        .rounding(Rounding::same(5.0))
-                        .min_size(Vec2::new(26.0, 22.0));
-
-                        if ui.add_enabled(self.zoom_percent < 150, zoom_in_btn).clicked() {
-                            self.zoom_percent = (self.zoom_percent + 10).min(150);
-                        }
-
-                        // Current Zoom Percentage badge (100% - 150%)
+                    draw_brand_mark(ui, 30.0);
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
                         ui.label(
-                            RichText::new(format!("{}%", self.zoom_percent))
-                                .size(11.5)
-                                .family(FontFamily::Monospace)
-                                .color(accent_green),
+                            RichText::new("5KD")
+                                .size(17.5)
+                                .strong()
+                                .color(TEXT_PRIMARY),
                         );
-
-                        // Zoom Out (-) down to 100%
-                        let zoom_out_btn = egui::Button::new(
-                            RichText::new("-")
-                                .size(13.0)
-                                .family(FontFamily::Monospace)
-                                .strong()
-                                .color(if self.zoom_percent > 100 {
-                                    accent_green
-                                } else {
-                                    muted_text
-                                }),
-                        )
-                        .fill(Color32::BLACK)
-                        .stroke(Stroke::new(1.0, border_col))
-                        .rounding(Rounding::same(5.0))
-                        .min_size(Vec2::new(26.0, 22.0));
-
-                        if ui.add_enabled(self.zoom_percent > 100, zoom_out_btn).clicked() {
-                            self.zoom_percent = (self.zoom_percent.saturating_sub(10)).max(100);
-                        }
-
                         ui.label(
-                            RichText::new("Zoom:")
-                                .size(11.5)
-                                .color(muted_text),
+                            RichText::new("Kick Downloader")
+                                .size(11.0)
+                                .color(TEXT_MUTED),
                         );
                     });
                 });
-            });
 
-        // Left Sidebar (#141414)
-        egui::SidePanel::left("sidebar")
-            .resizable(false)
-            .exact_width(205.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(sidebar_bg)
-                    .inner_margin(egui::Margin::same(16.0))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(31, 31, 31))),
-            )
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        draw_pixel_5_icon(ui, 26.0, accent_green);
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("5KD")
-                                .size(20.0)
-                                .strong()
-                                .color(Color32::WHITE),
-                        );
-                    });
-                    ui.label(
-                        RichText::new("5wi's Kick Downloader")
-                            .size(11.5)
-                            .color(muted_text),
-                    );
-                    ui.add_space(20.0);
+                ui.add_space(22.0);
 
-                    let nav_items = [
-                        (Tab::Downloads, "Downloads", self.active_downloads.len()),
-                        (Tab::Terminal, "Terminal", self.terminal_logs.len()),
-                        (Tab::Completed, "Completed", self.completed_downloads.len()),
-                        (Tab::About, "About", 0),
-                    ];
+                // Primary Navigation Tabs
+                let nav_items = [
+                    (Tab::Downloads, "Downloads", self.active_downloads.len()),
+                    (Tab::Terminal, "Terminal", self.terminal_logs.len()),
+                    (Tab::Completed, "Completed", self.completed_downloads.len()),
+                    (Tab::About, "About", 0),
+                ];
 
-                    for (tab, label, count) in nav_items {
-                        let is_selected = self.current_tab == tab;
-                        let fg = if is_selected {
-                            accent_green
-                        } else {
-                            muted_text
-                        };
+                for (tab, label, count) in nav_items {
+                    let is_selected = self.current_tab == tab;
+                    let fg = if is_selected { ACCENT_GREEN } else { TEXT_MUTED };
+                    let bg_fill = if is_selected {
+                        ACCENT_TINT
+                    } else {
+                        Color32::TRANSPARENT
+                    };
 
-                        // Subtle dark-green tint (#001402) when selected, matching rgba(0, 231, 1, 0.08) over black
-                        let bg_fill = if is_selected {
-                            Color32::from_rgb(0, 20, 2)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
+                    let btn_res = egui::Frame::none()
+                        .fill(bg_fill)
+                        .rounding(Rounding {
+                            nw: 0.0,
+                            sw: 0.0,
+                            ne: 7.0,
+                            se: 7.0,
+                        })
+                        .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                draw_nav_icon(ui, tab, 17.0, fg);
+                                ui.add_space(4.0);
+                                let text = RichText::new(label).size(13.5).color(fg);
+                                ui.label(if is_selected { text.strong() } else { text });
 
-                        let btn_res = egui::Frame::none()
-                            .fill(bg_fill)
-                            .rounding(Rounding {
-                                nw: 0.0,
-                                sw: 0.0,
-                                ne: 6.0,
-                                se: 6.0,
-                            })
-                            .inner_margin(egui::Margin::symmetric(12.0, 9.0))
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    draw_tab_icon(ui, tab, 20.0, accent_green);
-                                    ui.add_space(8.0);
-                                    let text = RichText::new(label).size(13.5).color(fg);
-                                    ui.label(if is_selected { text.strong() } else { text });
+                                if count > 0 {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if count > 0 {
-                                                ui.label(
-                                                    RichText::new(format!("{}", count))
-                                                        .size(11.0)
-                                                        .color(accent_green)
-                                                        .family(FontFamily::Monospace),
-                                                );
-                                            }
+                                            ui.label(
+                                                RichText::new(count.to_string())
+                                                    .size(11.0)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(if is_selected {
+                                                        ACCENT_GREEN
+                                                    } else {
+                                                        TEXT_MUTED
+                                                    }),
+                                            );
                                         },
                                     );
-                                });
+                                }
                             });
+                        });
 
-                        let interact = btn_res.response.interact(egui::Sense::click());
-                        if interact.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-
-                        // Left vertical #00e701 line indicator for active/hovered tab
-                        if is_selected {
-                            ui.painter().vline(
-                                btn_res.response.rect.left(),
-                                btn_res.response.rect.y_range(),
-                                Stroke::new(3.0, accent_green),
-                            );
-                        } else if interact.hovered() {
-                            ui.painter().vline(
-                                btn_res.response.rect.left(),
-                                btn_res.response.rect.y_range(),
-                                Stroke::new(2.0, accent_green),
-                            );
-                        }
-
-                        if interact.clicked() {
-                            self.current_tab = tab;
-                        }
-                        ui.add_space(4.0);
+                    let interact = btn_res.response.interact(Sense::click());
+                    if interact.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
+
+                    if is_selected {
+                        ui.painter().vline(
+                            btn_res.response.rect.left(),
+                            btn_res.response.rect.y_range(),
+                            Stroke::new(2.5, ACCENT_GREEN),
+                        );
+                    } else if interact.hovered() {
+                        ui.painter().vline(
+                            btn_res.response.rect.left(),
+                            btn_res.response.rect.y_range(),
+                            Stroke::new(2.0, BORDER_HOVER),
+                        );
+                    }
+
+                    if interact.clicked() {
+                        self.current_tab = tab;
+                    }
+                    ui.add_space(2.0);
+                }
+
+                // Sidebar Footer: Compact Zoom Stepper pinned to bottom
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    egui::Frame::none()
+                        .fill(BG_SURFACE)
+                        .rounding(Rounding::same(8.0))
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Zoom").size(12.0).color(TEXT_MUTED));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let zoom_in = egui::Button::new(
+                                            RichText::new("+")
+                                                .size(13.0)
+                                                .family(FontFamily::Monospace)
+                                                .strong()
+                                                .color(if self.zoom_percent < 150 {
+                                                    TEXT_PRIMARY
+                                                } else {
+                                                    TEXT_MUTED
+                                                }),
+                                        )
+                                        .fill(BG_ELEVATED)
+                                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                        .rounding(Rounding::same(5.0))
+                                        .min_size(Vec2::new(24.0, 22.0));
+
+                                        if ui.add_enabled(self.zoom_percent < 150, zoom_in).clicked()
+                                        {
+                                            self.zoom_percent = (self.zoom_percent + 10).min(150);
+                                            self.persist_config();
+                                        }
+
+                                        ui.label(
+                                            RichText::new(format!("{}%", self.zoom_percent))
+                                                .size(11.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(ACCENT_GREEN),
+                                        );
+
+                                        let zoom_out = egui::Button::new(
+                                            RichText::new("-")
+                                                .size(13.0)
+                                                .family(FontFamily::Monospace)
+                                                .strong()
+                                                .color(if self.zoom_percent > 100 {
+                                                    TEXT_PRIMARY
+                                                } else {
+                                                    TEXT_MUTED
+                                                }),
+                                        )
+                                        .fill(BG_ELEVATED)
+                                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                        .rounding(Rounding::same(5.0))
+                                        .min_size(Vec2::new(24.0, 22.0));
+
+                                        if ui
+                                            .add_enabled(self.zoom_percent > 100, zoom_out)
+                                            .clicked()
+                                        {
+                                            self.zoom_percent =
+                                                self.zoom_percent.saturating_sub(10).max(100);
+                                            self.persist_config();
+                                        }
+                                    },
+                                );
+                            });
+                        });
                 });
             });
 
-        // Main Central Panel (#000000)
+        // Main Content Canvas (#000000)
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::BLACK)
-                    .inner_margin(egui::Margin::same(22.0)),
+                    .fill(BG_CANVAS)
+                    .inner_margin(egui::Margin::symmetric(24.0, 22.0)),
             )
             .show(ctx, |ui| match self.current_tab {
                 Tab::Downloads => {
                     let folder_selected = self.has_chosen_folder();
                     let can_download = folder_selected && !self.url_input.trim().is_empty();
 
-                    // 1. Top URL Bar with #00e701 hover accent
-                    let url_frame = egui::Frame::none()
-                        .fill(input_bg)
+                    // 1. Primary URL Bar [Input | Paste | Download] with responsive right-to-left anchoring
+                    egui::Frame::none()
+                        .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, border_col))
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
                         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let text_edit = egui::TextEdit::singleline(&mut self.url_input)
-                                    .hint_text("Paste Kick VOD/Clip URL here...")
-                                    .frame(false)
-                                    .font(FontId::proportional(15.0))
-                                    .desired_width(ui.available_width() - 115.0);
-                                let resp = ui.add(text_edit);
-                                if resp.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                    && can_download
-                                {
-                                    self.start_download();
-                                }
-
-                                let dl_btn = egui::Button::new(
-                                    RichText::new("Download")
-                                        .size(13.5)
-                                        .strong()
-                                        .color(if can_download {
-                                            accent_green
+                            ui.set_min_width(ui.available_width());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let dl_clicked = ui
+                                    .scope(|ui| {
+                                        if can_download {
+                                            let w = &mut ui.visuals_mut().widgets;
+                                            w.hovered.bg_fill = Color32::from_rgb(38, 255, 39);
+                                            w.hovered.weak_bg_fill = Color32::from_rgb(38, 255, 39);
+                                            w.hovered.bg_stroke =
+                                                Stroke::new(1.0, Color32::from_rgb(38, 255, 39));
+                                            w.active.bg_fill = Color32::from_rgb(0, 200, 1);
+                                            w.active.weak_bg_fill = Color32::from_rgb(0, 200, 1);
+                                            w.active.bg_stroke =
+                                                Stroke::new(1.0, Color32::from_rgb(0, 200, 1));
+                                        }
+                                        let dl_btn = egui::Button::new(
+                                            RichText::new("Download")
+                                                .size(13.5)
+                                                .strong()
+                                                .color(if can_download {
+                                                    Color32::BLACK
+                                                } else {
+                                                    TEXT_MUTED
+                                                }),
+                                        )
+                                        .fill(if can_download {
+                                            ACCENT_GREEN
                                         } else {
-                                            muted_text
-                                        }),
-                                )
-                                .fill(Color32::BLACK)
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if can_download {
-                                        accent_green
-                                    } else {
-                                        border_col
-                                    },
-                                ))
-                                .rounding(Rounding::same(8.0))
-                                .min_size(Vec2::new(100.0, 34.0));
+                                            BG_ELEVATED
+                                        })
+                                        .stroke(Stroke::new(
+                                            1.0,
+                                            if can_download {
+                                                ACCENT_GREEN
+                                            } else {
+                                                BORDER_SUBTLE
+                                            },
+                                        ))
+                                        .rounding(Rounding::same(8.0))
+                                        .min_size(Vec2::new(104.0, 34.0));
 
-                                let dl_resp = ui
-                                    .add_enabled(can_download, dl_btn)
-                                    .on_disabled_hover_text(
-                                        "Choose an output folder below before downloading",
-                                    );
-                                if dl_resp.clicked() {
+                                        ui.add_enabled(can_download, dl_btn)
+                                            .on_disabled_hover_text(if !folder_selected {
+                                                "Choose an output folder below before downloading"
+                                            } else {
+                                                "Paste a Kick VOD or clip URL to download"
+                                            })
+                                            .clicked()
+                                    })
+                                    .inner;
+                                if dl_clicked {
                                     self.start_download();
                                 }
+
+                                // One-Click Paste button
+                                let paste_btn = styled_secondary_btn(
+                                    "Paste",
+                                    TEXT_PRIMARY,
+                                    BORDER_HOVER,
+                                    Vec2::new(66.0, 34.0),
+                                );
+                                if ui
+                                    .add(paste_btn)
+                                    .on_hover_text("Paste URL from clipboard")
+                                    .clicked()
+                                {
+                                    if let Some(clip) = read_clipboard_text() {
+                                        self.url_input = clip;
+                                        self.paste_notice = None;
+                                    } else {
+                                        self.paste_notice =
+                                            Some(("Clipboard is empty".to_string(), Instant::now()));
+                                        ctx.request_repaint_after(Duration::from_secs(2));
+                                    }
+                                }
+
+                                // Flexible URL TextEdit in left-to-right sub-layout
+                                let rem_w = ui.available_width().max(80.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(rem_w, 34.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        let text_edit =
+                                            egui::TextEdit::singleline(&mut self.url_input)
+                                                .hint_text("Paste Kick VOD or clip URL here...")
+                                                .frame(false)
+                                                .font(FontId::proportional(14.5))
+                                                .desired_width(f32::INFINITY);
+                                        let resp = ui.add(text_edit);
+                                        if resp.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                            && can_download
+                                        {
+                                            self.start_download();
+                                        }
+                                    },
+                                );
                             });
                         });
-                    if url_frame.response.hovered() {
-                        ui.painter().rect_stroke(
-                            url_frame.response.rect,
-                            Rounding::same(10.0),
-                            Stroke::new(1.5, accent_green),
-                        );
+
+                    if let Some((notice, _)) = &self.paste_notice {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(notice).size(11.5).color(STATUS_CANCELED));
                     }
 
                     ui.add_space(10.0);
 
-                    // 2. Controls Row: Start Time, End Time, Resolution, Container Extension
-                    let ctrl_frame = egui::Frame::none()
-                        .fill(card_bg)
+                    // 2. Stream Options Strip (Start Time, End Time, Resolution, Format)
+                    let mut config_dirty = false;
+                    egui::Frame::none()
+                        .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, border_col))
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
                         .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                         .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    RichText::new("Start Time (-ss):")
-                                        .size(12.5)
-                                        .color(muted_text),
-                                );
+                                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+
+                                ui.label(RichText::new("Start").size(12.5).color(TEXT_MUTED));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.start_time)
-                                        .hint_text("00:00:00 (Optional)")
-                                        .desired_width(120.0)
-                                        .font(FontId::monospace(12.5)),
+                                        .hint_text("00:00:00")
+                                        .desired_width(88.0)
+                                        .font(FontId::monospace(12.0)),
                                 );
 
-                                ui.add_space(10.0);
-
-                                ui.label(
-                                    RichText::new("End Time (-to):")
-                                        .size(12.5)
-                                        .color(muted_text),
-                                );
+                                ui.add_space(6.0);
+                                ui.label(RichText::new("End").size(12.5).color(TEXT_MUTED));
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.end_time)
-                                        .hint_text("Optional (HH:MM:SS)")
-                                        .desired_width(120.0)
-                                        .font(FontId::monospace(12.5)),
+                                        .hint_text("HH:MM:SS")
+                                        .desired_width(88.0)
+                                        .font(FontId::monospace(12.0)),
                                 );
 
-                                ui.add_space(10.0);
-
-                                // Resolution next to End Time
-                                ui.label(
-                                    RichText::new("Resolution:").size(12.5).color(muted_text),
-                                );
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("Quality").size(12.5).color(TEXT_MUTED));
                                 egui::ComboBox::from_id_salt("resolution_combo")
+                                    .width(142.0)
                                     .selected_text(
                                         RichText::new(self.resolution.label())
                                             .size(12.0)
                                             .family(FontFamily::Monospace)
                                             .strong()
-                                            .color(accent_green),
+                                            .color(ACCENT_GREEN),
                                     )
                                     .show_ui(ui, |ui| {
-                                        for r in [
-                                            Resolution::R1080p60,
-                                            Resolution::R1080p,
-                                            Resolution::R720p60,
-                                            Resolution::R720p,
-                                            Resolution::R480p,
-                                            Resolution::R360p,
-                                            Resolution::AudioOnly,
-                                        ] {
+                                        for r in Resolution::ALL {
                                             let is_sel = self.resolution == r;
                                             let item_btn = egui::Button::new(
                                                 RichText::new(r.label())
                                                     .size(12.0)
                                                     .family(FontFamily::Monospace)
-                                                    .strong()
                                                     .color(if is_sel {
-                                                        accent_green
+                                                        ACCENT_GREEN
                                                     } else {
-                                                        muted_text
+                                                        TEXT_PRIMARY
                                                     }),
                                             )
-                                            .fill(Color32::BLACK)
+                                            .fill(if is_sel { ACCENT_TINT } else { BG_SURFACE })
                                             .stroke(if is_sel {
-                                                Stroke::new(1.0, accent_green)
+                                                Stroke::new(1.0, ACCENT_GREEN)
                                             } else {
                                                 Stroke::NONE
                                             })
                                             .rounding(Rounding::same(5.0))
-                                            .min_size(Vec2::new(145.0, 24.0));
+                                            .min_size(Vec2::new(146.0, 26.0));
 
                                             if ui.add(item_btn).clicked() {
-                                                self.resolution = r;
+                                                if self.resolution != r {
+                                                    self.resolution = r;
+                                                    config_dirty = true;
+                                                }
                                                 ui.close_menu();
                                             }
                                         }
                                     });
 
-                                ui.add_space(10.0);
-
-                                // Container Extension to the right of Resolution
-                                // Uses green (#00e701) for text and black (#000000) for background
-                                ui.label(
-                                    RichText::new("Container Extension:")
-                                        .size(12.5)
-                                        .color(muted_text),
-                                );
-                                for ext in [ContainerExt::Mkv, ContainerExt::Mp4, ContainerExt::Ts]
-                                {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("Format").size(12.5).color(TEXT_MUTED));
+                                for ext in ContainerExt::ALL {
                                     let selected = self.container_ext == ext;
                                     let btn = egui::Button::new(
-                                        RichText::new(format!(".{}", ext.as_str().to_uppercase()))
+                                        RichText::new(ext.dot_upper())
                                             .size(11.5)
                                             .family(FontFamily::Monospace)
                                             .strong()
                                             .color(if selected {
-                                                accent_green
+                                                ACCENT_GREEN
                                             } else {
-                                                muted_text
+                                                TEXT_MUTED
                                             }),
                                     )
-                                    .fill(Color32::BLACK)
-                                    .stroke(if selected {
-                                        Stroke::new(1.5, accent_green)
-                                    } else {
-                                        Stroke::new(1.0, Color32::from_rgb(51, 51, 51))
-                                    })
-                                    .rounding(Rounding::same(5.0));
+                                    .fill(if selected { ACCENT_TINT } else { BG_ELEVATED })
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        if selected {
+                                            ACCENT_GREEN
+                                        } else {
+                                            BORDER_SUBTLE
+                                        },
+                                    ))
+                                    .rounding(Rounding::same(6.0))
+                                    .min_size(Vec2::new(46.0, 26.0));
 
-                                    if ui.add(btn).clicked() {
+                                    if ui.add(btn).clicked() && self.container_ext != ext {
                                         self.container_ext = ext;
+                                        config_dirty = true;
                                     }
                                 }
                             });
                         });
-                    if ctrl_frame.response.hovered() {
-                        ui.painter().rect_stroke(
-                            ctrl_frame.response.rect,
-                            Rounding::same(10.0),
-                            Stroke::new(1.0, accent_green),
-                        );
+                    if config_dirty {
+                        self.persist_config();
                     }
 
                     ui.add_space(10.0);
 
-                    // 3. Output Path + File Explorer Folder Picker (Required before downloading)
-                    let out_frame = egui::Frame::none()
-                        .fill(sidebar_bg)
+                    // 3. Output Destination Row (remembered across app restarts)
+                    egui::Frame::none()
+                        .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, border_col))
-                        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                        .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let folder_btn = styled_secondary_btn(
+                                    "Choose Folder",
+                                    if folder_selected {
+                                        TEXT_PRIMARY
+                                    } else {
+                                        ACCENT_GREEN
+                                    },
+                                    if folder_selected {
+                                        BORDER_HOVER
+                                    } else {
+                                        ACCENT_GREEN
+                                    },
+                                    Vec2::new(112.0, 30.0),
+                                );
+
+                                if ui.add(folder_btn).clicked() {
+                                    let mut dialog = rfd::FileDialog::new();
+                                    if folder_selected && Path::new(&self.output_path).is_dir() {
+                                        dialog = dialog.set_directory(&self.output_path);
+                                    }
+                                    if let Some(folder) = dialog.pick_folder() {
+                                        let chosen = folder.display().to_string();
+                                        self.output_path = chosen.clone();
+                                        self.persist_config();
+                                        self.push_log(format!(
+                                            "[config] Saved output destination: {}",
+                                            chosen
+                                        ));
+                                    }
+                                }
+
+                                let rem_w = ui.available_width().max(80.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(rem_w, 30.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("Output Folder")
+                                                .size(12.5)
+                                                .color(TEXT_MUTED),
+                                        );
+                                        ui.add_space(4.0);
+                                        let display_path = if folder_selected {
+                                            self.output_path.as_str()
+                                        } else {
+                                            "Required: click Choose Folder to set destination..."
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(display_path)
+                                                    .size(12.0)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(if folder_selected {
+                                                        TEXT_PRIMARY
+                                                    } else {
+                                                        TEXT_MUTED
+                                                    }),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                    ui.add_space(16.0);
+
+                    // 4. Scrollable Queue & Recent Downloads Region
+                    egui::ScrollArea::vertical()
+                        .id_salt("downloads_scroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new("Output Folder (-o):")
-                                        .size(12.5)
-                                        .color(muted_text),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.output_path)
-                                        .interactive(false)
-                                        .hint_text("Required: Click 'Choose Folder' to enable downloading...")
-                                        .desired_width(ui.available_width() - 135.0)
-                                        .font(FontId::monospace(12.0)),
-                                );
-
-                                let folder_btn = egui::Button::new(
-                                    RichText::new("Choose Folder")
-                                        .size(12.0)
+                                    RichText::new("Active Queue")
+                                        .size(15.0)
                                         .strong()
-                                        .color(accent_green),
-                                )
-                                .fill(Color32::BLACK)
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if folder_selected {
-                                        Color32::from_rgb(51, 51, 51)
-                                    } else {
-                                        accent_green
-                                    },
-                                ))
-                                .rounding(Rounding::same(6.0));
-
-                                if ui.add(folder_btn).clicked() {
-                                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                        self.output_path = folder.display().to_string();
-                                    }
+                                        .color(TEXT_PRIMARY),
+                                );
+                                if !self.active_downloads.is_empty() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "· {}",
+                                            self.active_downloads.len()
+                                        ))
+                                        .size(13.0)
+                                        .family(FontFamily::Monospace)
+                                        .color(ACCENT_GREEN),
+                                    );
                                 }
                             });
-                        });
-                    if out_frame.response.hovered() {
-                        ui.painter().rect_stroke(
-                            out_frame.response.rect,
-                            Rounding::same(10.0),
-                            Stroke::new(1.0, accent_green),
-                        );
-                    }
+                            ui.add_space(6.0);
 
-                    ui.add_space(18.0);
-
-                    // 4. Active Downloads Queue with Cancel Button
-                    ui.label(
-                        RichText::new("Download Queue / Active")
-                            .size(15.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
-                    ui.add_space(6.0);
-
-                    if self.active_downloads.is_empty() {
-                        let empty_active = egui::Frame::none()
-                            .fill(card_bg)
-                            .rounding(Rounding::same(10.0))
-                            .stroke(Stroke::new(1.0, border_col))
-                            .inner_margin(egui::Margin::same(18.0))
-                            .show(ui, |ui| {
-                                let hint_msg = if folder_selected {
-                                    "No active downloads. Paste any Kick VOD URL above to automatically extract & download."
-                                } else {
-                                    "No active downloads. Choose an output folder first, then paste any Kick VOD URL to download."
-                                };
-                                ui.label(
-                                    RichText::new(hint_msg)
-                                        .size(13.0)
-                                        .color(muted_text),
-                                );
-                            });
-                        if empty_active.response.hovered() {
-                            ui.painter().rect_stroke(
-                                empty_active.response.rect,
-                                Rounding::same(10.0),
-                                Stroke::new(1.0, accent_green),
-                            );
-                        }
-                    } else {
-                        let mut cancel_target_id: Option<usize> = None;
-
-                        for item in &self.active_downloads {
-                            let card_res = egui::Frame::none()
-                                .fill(card_bg)
-                                .rounding(Rounding::same(10.0))
-                                .stroke(Stroke::new(1.0, border_col))
-                                .inner_margin(egui::Margin::same(14.0))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
+                            if self.active_downloads.is_empty() {
+                                egui::Frame::none()
+                                    .fill(BG_SURFACE)
+                                    .rounding(Rounding::same(10.0))
+                                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                    .inner_margin(egui::Margin::symmetric(16.0, 16.0))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        let hint_msg = if folder_selected {
+                                            "No active downloads. Paste any Kick VOD URL above to start."
+                                        } else {
+                                            "Choose an output folder above, then paste any Kick VOD URL to start."
+                                        };
                                         ui.label(
-                                            RichText::new(&item.title)
-                                                .size(14.0)
-                                                .strong()
-                                                .color(Color32::WHITE),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                let cancel_btn = egui::Button::new(
-                                                    RichText::new("Cancel")
-                                                        .size(12.0)
-                                                        .strong()
-                                                        .color(accent_green),
-                                                )
-                                                .fill(Color32::BLACK)
-                                                .stroke(Stroke::new(1.0, accent_green))
-                                                .rounding(Rounding::same(6.0))
-                                                .min_size(Vec2::new(72.0, 26.0));
-
-                                                if ui.add(cancel_btn).clicked() {
-                                                    cancel_target_id = Some(item.id);
-                                                }
-                                            },
+                                            RichText::new(hint_msg).size(13.0).color(TEXT_MUTED),
                                         );
                                     });
-                                    ui.add_space(6.0);
-                                    ui.add(
-                                        egui::ProgressBar::new(item.progress)
-                                            .fill(accent_green)
-                                            .show_percentage(),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new(&item.status_text)
-                                            .size(11.5)
-                                            .color(muted_text)
-                                            .family(FontFamily::Monospace),
-                                    );
-                                });
-                            if card_res.response.hovered() {
-                                ui.painter().rect_stroke(
-                                    card_res.response.rect,
-                                    Rounding::same(10.0),
-                                    Stroke::new(1.0, accent_green),
-                                );
-                            }
-                            ui.add_space(8.0);
-                        }
+                            } else {
+                                let mut cancel_target_id: Option<usize> = None;
 
-                        if let Some(id_to_cancel) = cancel_target_id {
-                            self.cancel_download(id_to_cancel);
-                        }
-                    }
+                                for item in &self.active_downloads {
+                                    egui::Frame::none()
+                                        .fill(BG_SURFACE)
+                                        .rounding(Rounding::same(10.0))
+                                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                        .inner_margin(egui::Margin::same(14.0))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(ui.available_width());
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let cancel_btn = styled_secondary_btn(
+                                                        "Cancel",
+                                                        STATUS_FAILED,
+                                                        BORDER_HOVER,
+                                                        Vec2::new(72.0, 28.0),
+                                                    );
+                                                    if ui.add(cancel_btn).clicked() {
+                                                        cancel_target_id = Some(item.id);
+                                                    }
 
-                    ui.add_space(14.0);
-
-                    // 5. Recent Downloads
-                    ui.label(
-                        RichText::new("Recent Downloads")
-                            .size(15.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
-                    ui.add_space(6.0);
-
-                    if self.completed_downloads.is_empty() {
-                        let empty_rec = egui::Frame::none()
-                            .fill(card_bg)
-                            .rounding(Rounding::same(10.0))
-                            .stroke(Stroke::new(1.0, border_col))
-                            .inner_margin(egui::Margin::same(16.0))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("No completed downloads yet.")
-                                        .size(13.0)
-                                        .color(muted_text),
-                                );
-                            });
-                        if empty_rec.response.hovered() {
-                            ui.painter().rect_stroke(
-                                empty_rec.response.rect,
-                                Rounding::same(10.0),
-                                Stroke::new(1.0, accent_green),
-                            );
-                        }
-                    } else {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for item in &self.completed_downloads {
-                                let rec_res = egui::Frame::none()
-                                    .fill(card_bg)
-                                    .rounding(Rounding::same(10.0))
-                                    .stroke(Stroke::new(1.0, border_col))
-                                    .inner_margin(egui::Margin::same(12.0))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.vertical(|ui| {
+                                                    let rem_w = ui.available_width().max(80.0);
+                                                    ui.allocate_ui_with_layout(
+                                                        Vec2::new(rem_w, 28.0),
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(&item.title)
+                                                                        .size(13.5)
+                                                                        .strong()
+                                                                        .color(TEXT_PRIMARY),
+                                                                )
+                                                                .truncate(),
+                                                            );
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                            ui.add_space(8.0);
+                                            draw_progress_row(ui, item.progress);
+                                            ui.add_space(5.0);
+                                            ui.horizontal(|ui| {
                                                 ui.label(
-                                                    RichText::new(&item.title)
-                                                        .size(13.5)
-                                                        .strong()
-                                                        .color(Color32::WHITE),
+                                                    RichText::new(format!(
+                                                        "{} · {}",
+                                                        item.resolution, item.format
+                                                    ))
+                                                    .size(11.5)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(ACCENT_GREEN),
                                                 );
                                                 ui.label(
-                                                    RichText::new(&item.status_text)
+                                                    RichText::new("·")
                                                         .size(11.5)
-                                                        .color(if item.is_failed {
-                                                            Color32::LIGHT_RED
-                                                        } else {
-                                                            accent_green
-                                                        })
-                                                        .family(FontFamily::Monospace),
+                                                        .color(TEXT_MUTED),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&item.status_text)
+                                                            .size(11.5)
+                                                            .family(FontFamily::Monospace)
+                                                            .color(TEXT_MUTED),
+                                                    )
+                                                    .truncate(),
                                                 );
                                             });
                                         });
-                                    });
-                                if rec_res.response.hovered() {
-                                    ui.painter().rect_stroke(
-                                        rec_res.response.rect,
-                                        Rounding::same(10.0),
-                                        Stroke::new(1.0, accent_green),
-                                    );
+                                    ui.add_space(8.0);
                                 }
-                                ui.add_space(6.0);
+
+                                if let Some(id_to_cancel) = cancel_target_id {
+                                    self.cancel_download(id_to_cancel);
+                                }
+                            }
+
+                            ui.add_space(16.0);
+
+                            // Recent Downloads Section
+                            ui.label(
+                                RichText::new("Recent Downloads")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.add_space(6.0);
+
+                            if self.completed_downloads.is_empty() {
+                                egui::Frame::none()
+                                    .fill(BG_SURFACE)
+                                    .rounding(Rounding::same(10.0))
+                                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                    .inner_margin(egui::Margin::symmetric(16.0, 16.0))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.label(
+                                            RichText::new("No completed downloads yet.")
+                                                .size(13.0)
+                                                .color(TEXT_MUTED),
+                                        );
+                                    });
+                            } else {
+                                for item in self.completed_downloads.iter().take(5) {
+                                    self.render_history_card(ui, item);
+                                    ui.add_space(6.0);
+                                }
                             }
                         });
-                    }
                 }
 
                 Tab::Terminal => {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("Live Terminal Output")
+                            RichText::new("Terminal Output")
                                 .size(17.0)
                                 .strong()
-                                .color(Color32::WHITE),
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.label(
+                            RichText::new(format!("· {} lines", self.terminal_logs.len()))
+                                .size(12.0)
+                                .family(FontFamily::Monospace)
+                                .color(TEXT_MUTED),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Clear Logs").clicked() {
+                            let clear_btn = styled_secondary_btn(
+                                "Clear Logs",
+                                TEXT_PRIMARY,
+                                BORDER_HOVER,
+                                Vec2::new(88.0, 28.0),
+                            );
+                            if ui.add(clear_btn).clicked() {
                                 self.terminal_logs.clear();
                             }
                         });
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
+
+                    // Virtualized O(1) log rendering: only lays out visible rows
+                    let row_height = 19.0;
+                    let total_rows = self.terminal_logs.len();
                     egui::Frame::none()
-                        .fill(input_bg)
+                        .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, border_col))
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
                         .inner_margin(egui::Margin::same(12.0))
                         .show(ui, |ui| {
+                            ui.set_min_size(ui.available_size());
                             egui::ScrollArea::vertical()
+                                .id_salt("terminal_scroll")
+                                .auto_shrink([false, false])
                                 .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    for line in &self.terminal_logs {
-                                        ui.label(
-                                            RichText::new(line)
-                                                .size(12.0)
-                                                .family(FontFamily::Monospace)
-                                                .color(Color32::from_rgb(200, 205, 210)),
-                                        );
+                                .show_rows(ui, row_height, total_rows, |ui, row_range| {
+                                    for idx in row_range {
+                                        if let Some(line) = self.terminal_logs.get(idx) {
+                                            let line_color = if line.contains("[error]")
+                                                || line.contains("[extractor error]")
+                                            {
+                                                STATUS_FAILED
+                                            } else if line.contains("[cancel]") {
+                                                STATUS_CANCELED
+                                            } else if line.starts_with(">>>")
+                                                || line.contains("Extracted Master M3U8")
+                                            {
+                                                ACCENT_GREEN
+                                            } else {
+                                                Color32::from_rgb(198, 204, 212)
+                                            };
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(line)
+                                                        .size(12.0)
+                                                        .family(FontFamily::Monospace)
+                                                        .color(line_color),
+                                                )
+                                                .truncate(),
+                                            );
+                                        }
                                     }
                                 });
                         });
                 }
 
                 Tab::Completed => {
-                    ui.label(
-                        RichText::new("Completed Downloads")
-                            .size(17.0)
-                            .strong()
-                            .color(Color32::WHITE),
-                    );
-                    ui.add_space(8.0);
-                    if self.completed_downloads.is_empty() {
+                    ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("No completed downloads yet.")
-                                .size(13.0)
-                                .color(muted_text),
+                            RichText::new("Completed Downloads")
+                                .size(17.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
                         );
+                        if !self.completed_downloads.is_empty() {
+                            ui.label(
+                                RichText::new(format!("· {}", self.completed_downloads.len()))
+                                    .size(12.5)
+                                    .family(FontFamily::Monospace)
+                                    .color(TEXT_MUTED),
+                            );
+                        }
+                    });
+                    ui.add_space(10.0);
+
+                    if self.completed_downloads.is_empty() {
+                        egui::Frame::none()
+                            .fill(BG_SURFACE)
+                            .rounding(Rounding::same(10.0))
+                            .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                            .inner_margin(egui::Margin::same(18.0))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(
+                                    RichText::new("No completed downloads yet.")
+                                        .size(13.0)
+                                        .color(TEXT_MUTED),
+                                );
+                            });
                     } else {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for item in &self.completed_downloads {
-                                let comp_res = egui::Frame::none()
-                                    .fill(card_bg)
-                                    .rounding(Rounding::same(10.0))
-                                    .stroke(Stroke::new(1.0, border_col))
-                                    .inner_margin(egui::Margin::same(12.0))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            RichText::new(&item.title)
-                                                .size(14.0)
-                                                .strong()
-                                                .color(Color32::WHITE),
-                                        );
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "[{} · {}] {}",
-                                                item.resolution, item.format, item.status_text
-                                            ))
-                                            .size(12.0)
-                                            .color(accent_green)
-                                            .family(FontFamily::Monospace),
-                                        );
-                                    });
-                                if comp_res.response.hovered() {
-                                    ui.painter().rect_stroke(
-                                        comp_res.response.rect,
-                                        Rounding::same(10.0),
-                                        Stroke::new(1.0, accent_green),
-                                    );
+                        egui::ScrollArea::vertical()
+                            .id_salt("completed_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for item in &self.completed_downloads {
+                                    self.render_history_card(ui, item);
+                                    ui.add_space(8.0);
                                 }
-                                ui.add_space(6.0);
-                            }
-                        });
+                            });
                     }
                 }
 
                 Tab::About => {
                     ui.horizontal(|ui| {
-                        draw_pixel_5_icon(ui, 36.0, accent_green);
-                        ui.add_space(10.0);
+                        draw_brand_mark(ui, 40.0);
+                        ui.add_space(8.0);
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new("5KD - 5wi's Kick Downloader")
-                                        .size(19.0)
+                                        .size(18.5)
                                         .strong()
-                                        .color(Color32::WHITE),
+                                        .color(TEXT_PRIMARY),
                                 );
                                 ui.label(
-                                    RichText::new("1.0v")
+                                    RichText::new("· 1.0v")
                                         .size(12.5)
                                         .family(FontFamily::Monospace)
-                                        .strong()
-                                        .color(accent_green),
+                                        .color(ACCENT_GREEN),
                                 );
                             });
                             ui.label(
                                 RichText::new(
-                                    "High-performance Kick.com VOD & clip downloader written in Rust.",
+                                    "Lightweight Kick.com VOD and clip downloader written in Rust.",
                                 )
                                 .size(13.0)
-                                .color(muted_text),
+                                .color(TEXT_MUTED),
                             );
                         });
                     });
 
-                    ui.add_space(16.0);
+                    ui.add_space(18.0);
 
-                    let about_card = egui::Frame::none()
-                        .fill(card_bg)
+                    egui::Frame::none()
+                        .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, border_col))
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
                         .inner_margin(egui::Margin::same(16.0))
                         .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
                             ui.label(
                                 RichText::new("Architecture & Engine")
                                     .size(14.5)
                                     .strong()
-                                    .color(Color32::WHITE),
+                                    .color(TEXT_PRIMARY),
                             );
                             ui.add_space(6.0);
                             ui.label(
                                 RichText::new(
-                                    "Built natively in Rust using eframe/egui, reqwest, rfd, yt-dlp, and ffmpeg for multi-threaded HLS stream downloading and lossless time slicing.",
+                                    "Built natively in Rust using eframe/egui, reqwest (rustls), rfd, arboard, yt-dlp, and ffmpeg for low-resource HLS stream downloading and lossless time slicing.",
                                 )
-                                .size(12.5)
-                                .color(muted_text),
+                                .size(13.0)
+                                .color(TEXT_MUTED),
                             );
                         });
-                    if about_card.response.hovered() {
-                        ui.painter().rect_stroke(
-                            about_card.response.rect,
-                            Rounding::same(10.0),
-                            Stroke::new(1.0, accent_green),
-                        );
-                    }
 
                     ui.add_space(12.0);
 
-                    // Credit Card for mortyobnoxious/kickvod-extractor
-                    let credit_card = egui::Frame::none()
-                        .fill(card_bg)
+                    egui::Frame::none()
+                        .fill(BG_SURFACE)
                         .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, border_col))
+                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
                         .inner_margin(egui::Margin::same(16.0))
                         .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
                             ui.label(
                                 RichText::new("Credits & Acknowledgments")
                                     .size(14.5)
                                     .strong()
-                                    .color(Color32::WHITE),
+                                    .color(TEXT_PRIMARY),
                             );
                             ui.add_space(6.0);
                             ui.label(
                                 RichText::new(
                                     "M3U8 URL Extractor logic powered by kickvod-extractor by mortyobnoxious:",
                                 )
-                                .size(12.5)
-                                .color(muted_text),
+                                .size(13.0)
+                                .color(TEXT_MUTED),
                             );
                             ui.add_space(4.0);
                             ui.hyperlink("https://github.com/mortyobnoxious/kickvod-extractor");
                         });
-                    if credit_card.response.hovered() {
-                        ui.painter().rect_stroke(
-                            credit_card.response.rect,
-                            Rounding::same(10.0),
-                            Stroke::new(1.0, accent_green),
-                        );
-                    }
                 }
             });
     }
@@ -2095,7 +2658,7 @@ fn load_window_icon() -> Arc<egui::IconData> {
         for x in 0..size {
             let idx = (y * size + x) * 4;
             let mut is_green = false;
-            if x >= 8 && x < 56 && y >= 5 && y < 59 {
+            if (8..56).contains(&x) && (5..59).contains(&y) {
                 let gx = (x - 8) / 3;
                 let gy = (y - 5) / 3;
                 if gy < 18 && gx < 16 && ICON_5_GRID[gy].as_bytes()[gx] == b'#' {
@@ -2103,15 +2666,11 @@ fn load_window_icon() -> Arc<egui::IconData> {
                 }
             }
             if is_green {
-                // #00e701 -> R: 0, G: 231, B: 1
                 rgba[idx] = 0;
                 rgba[idx + 1] = 231;
                 rgba[idx + 2] = 1;
                 rgba[idx + 3] = 255;
             } else {
-                rgba[idx] = 0;
-                rgba[idx + 1] = 0;
-                rgba[idx + 2] = 0;
                 rgba[idx + 3] = 255;
             }
         }
