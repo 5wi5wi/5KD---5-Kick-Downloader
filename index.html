@@ -757,6 +757,136 @@
         text-decoration: underline;
       }
 
+      /* Software Updates UI */
+      .update-banner {
+        display: none;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        background: var(--accent-tint);
+        border: 1px solid var(--accent-green);
+        border-radius: 10px;
+        padding: 9px 14px;
+        margin-bottom: 12px;
+      }
+
+      .update-banner.visible {
+        display: flex;
+      }
+
+      .update-banner-info {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        min-width: 0;
+        flex-wrap: wrap;
+      }
+
+      .update-banner-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--accent-green);
+      }
+
+      .update-banner-asset {
+        font-size: 11.5px;
+        color: var(--text-muted);
+      }
+
+      .update-banner-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+      }
+
+      .update-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .update-sub {
+        margin-top: 3px;
+        font-size: 11.5px;
+        color: var(--text-muted);
+      }
+
+      .update-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+      }
+
+      .update-check-row {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 12px;
+        font-size: 13px;
+        color: var(--text-primary);
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .update-check-row input[type='checkbox'] {
+        width: 15px;
+        height: 15px;
+        accent-color: var(--accent-green);
+        cursor: pointer;
+      }
+
+      .update-repo-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .update-repo-row label {
+        font-size: 12px;
+        color: var(--text-muted);
+        white-space: nowrap;
+      }
+
+      .update-repo-input {
+        width: 240px;
+        height: 28px;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-subtle);
+        border-radius: 6px;
+        color: var(--text-primary);
+        font-size: 12px;
+        padding: 0 9px;
+        outline: none;
+      }
+
+      .update-repo-input:focus {
+        border-color: var(--accent-green);
+      }
+
+      .update-status {
+        margin-top: 12px;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--text-muted);
+      }
+
+      .update-status.ok {
+        color: var(--accent-green);
+      }
+
+      .update-status.err {
+        color: var(--status-failed);
+      }
+
+      .update-progress-wrap {
+        margin-top: 10px;
+      }
+
       /* Subtle inline notification toast */
       .inline-toast {
         position: fixed;
@@ -853,7 +983,7 @@
               <span id="badge-done" class="nav-count mono"></span>
             </button>
 
-            <button type="button" class="nav-btn" onclick="switchTab('about', this)">
+            <button type="button" id="nav-about-btn" class="nav-btn" onclick="switchTab('about', this)">
               <span class="nav-btn-left">
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="12" cy="12" r="8.5" />
@@ -862,6 +992,7 @@
                 </svg>
                 <span>About</span>
               </span>
+              <span id="badge-about" class="nav-count mono"></span>
             </button>
           </nav>
         </div>
@@ -877,6 +1008,17 @@
       </aside>
 
       <main class="main">
+        <div id="update-banner" class="update-banner" role="status" aria-live="polite">
+          <div class="update-banner-info">
+            <span id="update-banner-title" class="update-banner-title">Update available</span>
+            <span id="update-banner-asset" class="update-banner-asset mono"></span>
+          </div>
+          <div class="update-banner-actions">
+            <button type="button" class="btn-primary" style="height:28px;padding:0 12px;font-size:12px;" onclick="installFromBanner()">Update &amp; Restart</button>
+            <button type="button" class="btn-secondary" style="height:28px;color:var(--text-muted);" onclick="dismissUpdateBanner()">Later</button>
+          </div>
+        </div>
+
         <!-- Downloads View -->
         <div id="tab-downloads" class="tab-view active">
           <form class="surface-bar url-bar" onsubmit="startDownload(event)">
@@ -997,10 +1139,44 @@
             <div>
               <div class="about-title-row">
                 <h2 class="about-title">5KD - 5wi's Kick Downloader</h2>
-                <span class="about-version mono">· 1.0v</span>
+                <span id="about-version" class="about-version mono">· 1.0v</span>
               </div>
               <p class="about-desc">Lightweight Kick.com VOD and clip downloader written in Rust.</p>
             </div>
+          </div>
+
+          <div class="card">
+            <div class="update-header">
+              <div>
+                <div class="about-card-title" style="margin-bottom:0;">Software Updates</div>
+                <div id="update-installed-meta" class="update-sub mono">Installed: 1.0v · 5KD-windows-x86_64-setup.exe</div>
+              </div>
+              <div class="update-actions">
+                <button type="button" id="update-install-btn" class="btn-primary" style="display:none;height:30px;padding:0 13px;font-size:12.5px;" onclick="startInAppUpdate()">Update &amp; Restart</button>
+                <button type="button" id="update-check-btn" class="btn-secondary" style="height:30px;" onclick="checkForUpdates(false)">Check for Updates</button>
+              </div>
+            </div>
+
+            <label class="update-check-row">
+              <input type="checkbox" id="check-updates-launch" checked onchange="toggleCheckUpdatesOnLaunch(this.checked)" />
+              <span>Check for updates when app launches</span>
+            </label>
+
+            <div class="update-repo-row">
+              <label for="github-repo-input">GitHub Repo</label>
+              <input id="github-repo-input" class="update-repo-input mono" type="text" placeholder="owner/repo (auto-filled in releases)" onchange="saveGithubRepo(this.value)" />
+            </div>
+
+            <div id="update-progress-wrap" class="update-progress-wrap" style="display:none;">
+              <div class="progress-row" style="margin:0;">
+                <div class="progress-track">
+                  <div id="update-prog-bar" class="progress-fill" style="width:0%;"></div>
+                </div>
+                <span id="update-prog-pct" class="progress-pct mono">0%</span>
+              </div>
+            </div>
+
+            <div id="update-status" class="update-status mono" style="display:none;"></div>
           </div>
 
           <div class="card">
@@ -1033,17 +1209,27 @@
         FORMAT_EXT: '5kd_format_ext',
         RES_VALUE: '5kd_res_value',
         RES_LABEL: '5kd_res_label',
-        ZOOM_PCT: '5kd_zoom_pct'
+        ZOOM_PCT: '5kd_zoom_pct',
+        CHECK_UPDATES_LAUNCH: '5kd_check_updates_launch',
+        GITHUB_REPO: '5kd_github_repo'
       };
+      let currentAppVersion = '1.0v';
+      const PLATFORM_INSTALLER_ASSET = '5KD-windows-x86_64-setup.exe';
 
       let currentExt = 'mkv';
       let currentZoom = 100;
+      let activeTab = 'downloads';
       let activeItem = null;
       let activeTimer = null;
       let activeCanceled = false;
       let toastTimer = null;
       const historyItems = [];
       let logCount = 2;
+
+      let updateBusy = false;
+      let availableUpdate = null;
+      let updateBannerDismissed = false;
+      let updateTimer = null;
 
       const els = {
         workspace: document.getElementById('workspace'),
@@ -1064,11 +1250,26 @@
         badgeDone: document.getElementById('badge-done'),
         completedSectionCount: document.getElementById('completed-section-count'),
         badgeLogs: document.getElementById('badge-logs'),
+        badgeAbout: document.getElementById('badge-about'),
+        navAboutBtn: document.getElementById('nav-about-btn'),
         termCount: document.getElementById('term-count'),
         termBox: document.getElementById('term-box'),
         activeList: document.getElementById('active-list'),
         recentList: document.getElementById('recent-list'),
-        completedList: document.getElementById('completed-list')
+        completedList: document.getElementById('completed-list'),
+        aboutVersion: document.getElementById('about-version'),
+        updateInstalledMeta: document.getElementById('update-installed-meta'),
+        updateBanner: document.getElementById('update-banner'),
+        updateBannerTitle: document.getElementById('update-banner-title'),
+        updateBannerAsset: document.getElementById('update-banner-asset'),
+        updateCheckBtn: document.getElementById('update-check-btn'),
+        updateInstallBtn: document.getElementById('update-install-btn'),
+        checkUpdatesLaunch: document.getElementById('check-updates-launch'),
+        githubRepoInput: document.getElementById('github-repo-input'),
+        updateProgressWrap: document.getElementById('update-progress-wrap'),
+        updateProgBar: document.getElementById('update-prog-bar'),
+        updateProgPct: document.getElementById('update-prog-pct'),
+        updateStatus: document.getElementById('update-status')
       };
 
       function safeSetStorage(key, val) {
@@ -1158,11 +1359,13 @@
       });
 
       function switchTab(tab, btn) {
+        activeTab = tab;
         ['downloads', 'terminal', 'completed', 'about'].forEach((t) => {
           document.getElementById('tab-' + t).classList.toggle('active', t === tab);
         });
         document.querySelectorAll('.nav-btn').forEach((b) => b.classList.remove('active'));
         btn.classList.add('active');
+        syncUpdateBanner();
       }
 
       async function pasteFromClipboard() {
@@ -1211,14 +1414,19 @@
       function logLine(msg) {
         const line = document.createElement('div');
         line.className = 'log-line';
-        if (msg.includes('[error]') || msg.includes('[extractor error]')) {
+        if (
+          msg.includes('[error]') ||
+          msg.includes('[extractor error]') ||
+          msg.includes('[updater error]')
+        ) {
           line.classList.add('log-error');
         } else if (msg.includes('[cancel]')) {
           line.classList.add('log-cancel');
         } else if (
           msg.startsWith('>>>') ||
           msg.includes('Extracted Master M3U8') ||
-          msg.includes('100% Completed')
+          msg.includes('100% Completed') ||
+          msg.includes('[updater] Update available:')
         ) {
           line.classList.add('log-accent');
         }
@@ -1605,6 +1813,201 @@
         }, 380);
       }
 
+      function parseVersionNumbers(tag) {
+        const cleaned = String(tag || '')
+          .trim()
+          .replace(/^[vV]+/, '')
+          .replace(/[vV]+$/, '');
+        return cleaned
+          .split(/[.\-_]/)
+          .map((part) => {
+            const m = part.match(/^\d+/);
+            return m ? parseInt(m[0], 10) : null;
+          })
+          .filter((n) => n !== null);
+      }
+
+      function isNewerVersion(latest, current) {
+        const a = parseVersionNumbers(latest);
+        const b = parseVersionNumbers(current);
+        if (a.length && b.length) {
+          const len = Math.max(a.length, b.length);
+          for (let i = 0; i < len; i++) {
+            const av = a[i] || 0;
+            const bv = b[i] || 0;
+            if (av !== bv) return av > bv;
+          }
+          return false;
+        }
+        return String(latest || '').trim().toLowerCase() !== String(current || '').trim().toLowerCase();
+      }
+
+      function formatBytes(bytes) {
+        if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+        if (bytes >= 1024) return Math.round(bytes / 1024) + ' KB';
+        return bytes + ' B';
+      }
+
+      function setUpdateStatus(text, tone) {
+        els.updateStatus.textContent = text;
+        els.updateStatus.style.display = text ? 'block' : 'none';
+        els.updateStatus.className = 'update-status mono' + (tone ? ' ' + tone : '');
+      }
+
+      function syncUpdateBanner() {
+        const hasAvail = Boolean(availableUpdate);
+        els.badgeAbout.textContent = hasAvail ? '1' : '';
+        els.updateInstallBtn.style.display = hasAvail && !updateBusy ? 'inline-flex' : 'none';
+        if (hasAvail && !updateBannerDismissed && activeTab !== 'about' && !updateBusy) {
+          els.updateBannerTitle.textContent = 'Update ' + availableUpdate.tagName + ' available';
+          els.updateBannerAsset.textContent = '· ' + availableUpdate.assetName;
+          els.updateBanner.classList.add('visible');
+        } else {
+          els.updateBanner.classList.remove('visible');
+        }
+      }
+
+      function dismissUpdateBanner() {
+        updateBannerDismissed = true;
+        syncUpdateBanner();
+      }
+
+      function installFromBanner() {
+        switchTab('about', els.navAboutBtn);
+        startInAppUpdate();
+      }
+
+      function toggleCheckUpdatesOnLaunch(checked) {
+        safeSetStorage(STORAGE_KEYS.CHECK_UPDATES_LAUNCH, checked ? '1' : '0');
+        logLine('[config] Check for updates on launch: ' + (checked ? 'enabled' : 'disabled'));
+      }
+
+      function saveGithubRepo(val) {
+        const cleaned = String(val || '').trim().replace(/^\/+|\/+$/g, '');
+        els.githubRepoInput.value = cleaned;
+        safeSetStorage(STORAGE_KEYS.GITHUB_REPO, cleaned);
+      }
+
+      async function checkForUpdates(isSilentLaunch) {
+        if (updateBusy) return;
+        const repo = els.githubRepoInput.value.trim().replace(/^\/+|\/+$/g, '');
+        if (!repo || !repo.includes('/')) {
+          if (!isSilentLaunch) {
+            setUpdateStatus('Enter owner/repo above to check GitHub Releases directly in-app.', 'err');
+          }
+          return;
+        }
+
+        updateBusy = true;
+        updateBannerDismissed = false;
+        els.updateCheckBtn.disabled = true;
+        els.updateCheckBtn.textContent = 'Checking...';
+        els.updateProgressWrap.style.display = 'none';
+        setUpdateStatus('Checking GitHub Releases for a newer version...', '');
+        logLine('[updater] Checking GitHub (' + repo + ') for newer releases...');
+
+        try {
+          let resp = await fetch('https://api.github.com/repos/' + repo + '/releases/latest', {
+            headers: { Accept: 'application/vnd.github+json' }
+          });
+          let release = null;
+          if (resp.ok) {
+            release = await resp.json();
+          } else if (resp.status === 404) {
+            const listResp = await fetch('https://api.github.com/repos/' + repo + '/releases?per_page=1', {
+              headers: { Accept: 'application/vnd.github+json' }
+            });
+            if (!listResp.ok) throw new Error('GitHub API returned HTTP ' + listResp.status);
+            const list = await listResp.json();
+            release = Array.isArray(list) ? list[0] : null;
+          } else {
+            throw new Error('GitHub API returned HTTP ' + resp.status);
+          }
+
+          if (!release || !release.tag_name) {
+            throw new Error('No GitHub releases found for ' + repo);
+          }
+
+          if (!isNewerVersion(release.tag_name, currentAppVersion)) {
+            availableUpdate = null;
+            setUpdateStatus('You are on the latest version (' + currentAppVersion + ').', 'ok');
+            logLine('[updater] 5KD is up to date (' + currentAppVersion + ').');
+          } else {
+            const assets = Array.isArray(release.assets) ? release.assets : [];
+            const matched = assets.find(
+              (a) => a && typeof a.name === 'string' && a.name.toLowerCase() === PLATFORM_INSTALLER_ASSET.toLowerCase()
+            );
+            if (!matched) {
+              throw new Error('Release ' + release.tag_name + ' missing ' + PLATFORM_INSTALLER_ASSET);
+            }
+            availableUpdate = {
+              tagName: release.tag_name,
+              assetName: matched.name,
+              size: matched.size || 0
+            };
+            const sizeTxt = availableUpdate.size ? ' (' + formatBytes(availableUpdate.size) + ')' : '';
+            setUpdateStatus(
+              'New release ' + availableUpdate.tagName + ' ready — ' + availableUpdate.assetName + sizeTxt,
+              'ok'
+            );
+            logLine('[updater] Update available: ' + availableUpdate.tagName + ' (' + availableUpdate.assetName + ')');
+          }
+        } catch (err) {
+          availableUpdate = null;
+          setUpdateStatus(err.message || 'Failed to check for updates', 'err');
+          logLine('[updater error] ' + (err.message || err));
+        } finally {
+          updateBusy = false;
+          els.updateCheckBtn.disabled = false;
+          els.updateCheckBtn.textContent = 'Check for Updates';
+          syncUpdateBanner();
+        }
+      }
+
+      function startInAppUpdate() {
+        if (updateBusy || !availableUpdate) return;
+        const target = availableUpdate;
+        updateBusy = true;
+        els.updateCheckBtn.disabled = true;
+        els.updateInstallBtn.style.display = 'none';
+        els.updateBanner.classList.remove('visible');
+        els.updateProgressWrap.style.display = 'block';
+        els.updateProgBar.style.width = '8%';
+        els.updateProgPct.textContent = '8%';
+        setUpdateStatus('Downloading ' + target.assetName + ' (' + target.tagName + ') directly in-app...', '');
+        logLine('[updater] Downloading ' + target.assetName + ' (' + target.tagName + ') directly inside 5KD...');
+
+        let pct = 8;
+        if (updateTimer) clearInterval(updateTimer);
+        updateTimer = setInterval(() => {
+          pct = Math.min(pct + 23, 100);
+          els.updateProgBar.style.width = pct + '%';
+          els.updateProgPct.textContent = pct + '%';
+          if (pct >= 100) {
+            clearInterval(updateTimer);
+            updateTimer = null;
+            setUpdateStatus(
+              'Installing ' + target.tagName + ', deleting temporary installer files, and restarting...',
+              'ok'
+            );
+            logLine('[updater] Installed ' + target.tagName + ', cleaned up temporary installer files, restarting...');
+            setTimeout(() => {
+              currentAppVersion = target.tagName;
+              availableUpdate = null;
+              updateBusy = false;
+              els.aboutVersion.textContent = '· ' + currentAppVersion;
+              els.updateInstalledMeta.textContent =
+                'Installed: ' + currentAppVersion + ' · ' + PLATFORM_INSTALLER_ASSET;
+              els.updateProgressWrap.style.display = 'none';
+              els.updateCheckBtn.disabled = false;
+              setUpdateStatus('Updated to ' + currentAppVersion + ' and cleaned up unused installer files.', 'ok');
+              showToast('5KD updated to ' + currentAppVersion);
+              syncUpdateBanner();
+            }, 900);
+          }
+        }, 280);
+      }
+
       // Restore persisted output destination and settings on startup
       (function restorePersistedState() {
         const savedZoom = parseInt(safeGetStorage(STORAGE_KEYS.ZOOM_PCT) || '100', 10);
@@ -1637,6 +2040,18 @@
           logLine('[config] Restored output destination: ' + savedFolder);
           updateDownloadButtonState();
           renderActiveQueue();
+        }
+
+        const savedCheckLaunch = safeGetStorage(STORAGE_KEYS.CHECK_UPDATES_LAUNCH);
+        const checkOnLaunch = savedCheckLaunch === null ? true : savedCheckLaunch === '1';
+        els.checkUpdatesLaunch.checked = checkOnLaunch;
+
+        const savedRepo = (safeGetStorage(STORAGE_KEYS.GITHUB_REPO) || '').trim();
+        if (savedRepo) {
+          els.githubRepoInput.value = savedRepo;
+          if (checkOnLaunch) {
+            checkForUpdates(true);
+          }
         }
       })();
     </script>

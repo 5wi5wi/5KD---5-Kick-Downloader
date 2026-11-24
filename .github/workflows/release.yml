@@ -32,6 +32,7 @@ jobs:
             bin_name: 5KD.exe
             setup_base: 5KD-windows-x86_64-setup
             iss_arch: x64compatible
+            installer_asset: 5KD-windows-x86_64-setup.exe
 
           - platform_name: Windows ARM64 Installer
             os: windows-latest
@@ -39,6 +40,7 @@ jobs:
             bin_name: 5KD.exe
             setup_base: 5KD-windows-arm64-setup
             iss_arch: arm64
+            installer_asset: 5KD-windows-arm64-setup.exe
 
           - platform_name: Linux x86_64
             os: ubuntu-latest
@@ -46,24 +48,43 @@ jobs:
             bin_name: 5KD
             asset_name: 5KD-linux-x86_64
             archive_name: 5KD-linux-x86_64.tar.gz
+            installer_asset: 5KD-linux-x86_64.tar.gz
 
           - platform_name: macOS Apple Silicon (ARM64)
-            os: macos-latest
+            os: macos-15-intel
             target: aarch64-apple-darwin
             bin_name: 5KD
             asset_name: 5KD-macos-arm64
             archive_name: 5KD-macos-arm64.tar.gz
+            installer_asset: 5KD-macos-arm64.tar.gz
 
           - platform_name: macOS Intel (x86_64)
-            os: macos-latest
+            os: macos-15-intel
             target: x86_64-apple-darwin
             bin_name: 5KD
             asset_name: 5KD-macos-x86_64
             archive_name: 5KD-macos-x86_64.tar.gz
+            installer_asset: 5KD-macos-x86_64.tar.gz
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Resolve Build Metadata (Version, Repo, Installer Asset)
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          else
+            TAG="1.0v"
+          fi
+          echo "FIVEKD_RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "FIVEKD_GITHUB_REPO=${{ github.repository }}" >> "$GITHUB_ENV"
+          echo "FIVEKD_INSTALLER_ASSET=${{ matrix.installer_asset }}" >> "$GITHUB_ENV"
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -103,6 +124,7 @@ jobs:
           }
           $srcExe = "target\${{ matrix.target }}\release\${{ matrix.bin_name }}"
           & $iscc "installer.iss" `
+            "/DMyAppVersion=$env:FIVEKD_RELEASE_TAG" `
             "/DMySourceExe=$srcExe" `
             "/DMyOutputDir=dist" `
             "/DMyOutputBaseFilename=${{ matrix.setup_base }}" `
@@ -122,7 +144,7 @@ jobs:
           tar -czf "dist/${{ matrix.archive_name }}" -C staging "${{ matrix.asset_name }}"
 
       - name: Upload platform artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.target }}
           path: dist/*
@@ -134,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
@@ -180,7 +202,7 @@ jobs:
           done
 
       - name: Create or Update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.resolve_tag.outputs.tag }}
           name: "5KD - 5wi's Kick Downloader (${{ steps.resolve_tag.outputs.tag }})"
@@ -197,6 +219,7 @@ jobs:
             | **macOS** | Intel (x86_64) | `5KD-macos-x86_64.tar.gz` |
 
             ### Highlights
+            - **In-App Auto-Updater**: Check for new GitHub releases directly inside the **About** tab or automatically on launch—downloads the matching platform installer directly inside the app with zero browser tabs, installs silently, cleans up temporary installer files, and restarts automatically.
             - **Fast Windows Setup Wizard Installer**: Native LZMA2-compressed installer with Start Menu shortcut, optional Desktop shortcut, embedded `#00E701` icon, and uninstaller support.
             - **VOD & Clip Title File Naming**: Automatically names downloaded files after the actual Kick VOD or Clip title.
             - **Persistent Output Folder**: Automatically remembers your chosen output folder, quality, container format, and zoom level across restarts.

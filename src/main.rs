@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -21,6 +21,12 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const DETACHED_PROCESS: u32 = 0x00000008;
+
+const APP_VERSION: &str = env!("FIVEKD_APP_VERSION");
+const GITHUB_REPO: &str = env!("FIVEKD_GITHUB_REPO");
+const INSTALLER_ASSET_NAME: &str = env!("FIVEKD_INSTALLER_ASSET");
 
 const AWS_ID: &str = "196233775518";
 const VIDDASTRAGE_PROXY: &str = "https://cors.viddastrage.workers.dev/corsproxy/?apiurl=";
@@ -196,6 +202,10 @@ fn default_zoom_percent() -> u32 {
     100
 }
 
+fn default_check_updates() -> bool {
+    true
+}
+
 /// Persistent user configuration saved across app restarts.
 #[derive(Serialize, Deserialize)]
 struct AppConfig {
@@ -207,6 +217,10 @@ struct AppConfig {
     resolution: String,
     #[serde(default)]
     container_ext: String,
+    #[serde(default = "default_check_updates")]
+    check_updates_on_launch: bool,
+    #[serde(default)]
+    github_repo: String,
 }
 
 impl Default for AppConfig {
@@ -216,6 +230,8 @@ impl Default for AppConfig {
             zoom_percent: 100,
             resolution: "1080p60".to_string(),
             container_ext: "mkv".to_string(),
+            check_updates_on_launch: true,
+            github_repo: String::new(),
         }
     }
 }
@@ -330,11 +346,45 @@ struct DownloadItem {
     child_pid: Arc<Mutex<Option<u32>>>,
 }
 
+#[derive(Clone)]
+struct UpdateReleaseInfo {
+    tag_name: String,
+    asset_name: String,
+    download_url: String,
+    asset_size: u64,
+    release_notes: String,
+}
+
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate(String),
+    Available(UpdateReleaseInfo),
+    Downloading {
+        tag_name: String,
+        asset_name: String,
+        downloaded: u64,
+        total: u64,
+    },
+    Installing(String),
+    Error(String),
+}
+
 enum WorkerEvent {
     Log(String),
     Extracted(usize, ExtractedVodMeta),
     Progress(usize, f32, String),
     Finished(usize, bool, String, Option<String>),
+    UpdateChecked(Result<Option<UpdateReleaseInfo>, String>),
+    UpdateProgress {
+        tag_name: String,
+        asset_name: String,
+        downloaded: u64,
+        total: u64,
+    },
+    UpdateReadyToRestart(String),
+    UpdateFailed(String),
 }
 
 /// Event-driven UI wakeup handle: keeps idle CPU/GPU at 0% while throttling rapid worker output.
@@ -1465,6 +1515,423 @@ fn styled_secondary_btn(
         .min_size(min_size)
 }
 
+fn updater_temp_dir() -> PathBuf {
+    env::temp_dir().join("5kd_updater")
+}
+
+/// Deletes any leftover downloaded installers, staging folders, or updater helper scripts.
+fn cleanup_leftover_update_files() {
+    let dir = updater_temp_dir();
+    if dir.exists() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+fn parse_version_numbers(tag: &str) -> Vec<u32> {
+    let trimmed = tag
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .trim_end_matches(['v', 'V']);
+    let mut nums = Vec::new();
+    for part in trimmed.split(['.', '-', '_']) {
+        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            if let Ok(n) = digits.parse::<u32>() {
+                nums.push(n);
+            }
+        }
+    }
+    nums
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let a = parse_version_numbers(latest);
+    let b = parse_version_numbers(current);
+    if !a.is_empty() && !b.is_empty() {
+        let len = a.len().max(b.len());
+        for i in 0..len {
+            let av = *a.get(i).unwrap_or(&0);
+            let bv = *b.get(i).unwrap_or(&0);
+            if av != bv {
+                return av > bv;
+            }
+        }
+        return false;
+    }
+    latest.trim().to_ascii_lowercase() != current.trim().to_ascii_lowercase()
+}
+
+fn is_allowed_github_download_url(url: &str) -> bool {
+    url.starts_with("https://github.com/")
+        || url.starts_with("https://objects.githubusercontent.com/")
+        || url.starts_with("https://release-assets.githubusercontent.com/")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn check_github_latest_release(repo: &str) -> Result<Option<UpdateReleaseInfo>, String> {
+    let clean_repo = repo.trim().trim_matches('/');
+    if clean_repo.is_empty() || !clean_repo.contains('/') {
+        return Err(
+            "GitHub repository is not configured (set owner/repo in build or About tab)."
+                .to_string(),
+        );
+    }
+
+    let client = shared_http_client()?;
+    let latest_url = format!("https://api.github.com/repos/{}/releases/latest", clean_repo);
+    let ua = format!("5KD-Updater/{}", APP_VERSION);
+
+    let resp = client
+        .get(&latest_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", &ua)
+        .send()
+        .map_err(|e| format!("Network error checking GitHub: {}", e))?;
+
+    let release_val: Value = if resp.status().is_success() {
+        resp.json()
+            .map_err(|e| format!("Invalid GitHub release JSON: {}", e))?
+    } else if resp.status().as_u16() == 404 {
+        // Fallback if latest release is prerelease or tag-only list
+        let list_url = format!(
+            "https://api.github.com/repos/{}/releases?per_page=1",
+            clean_repo
+        );
+        let list_resp = client
+            .get(&list_url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", &ua)
+            .send()
+            .map_err(|e| format!("Network error checking GitHub releases: {}", e))?;
+        if !list_resp.status().is_success() {
+            return Err(format!("GitHub API returned HTTP {}", list_resp.status().as_u16()));
+        }
+        let arr: Value = list_resp
+            .json()
+            .map_err(|e| format!("Invalid GitHub releases list JSON: {}", e))?;
+        arr.as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .ok_or_else(|| "No GitHub releases found for this repository".to_string())?
+    } else {
+        return Err(format!("GitHub API returned HTTP {}", resp.status().as_u16()));
+    };
+
+    let tag_name = non_empty_str(release_val.get("tag_name"))
+        .ok_or_else(|| "GitHub release missing tag_name".to_string())?
+        .to_string();
+
+    if !is_newer_version(&tag_name, APP_VERSION) {
+        return Ok(None);
+    }
+
+    let assets = release_val
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| format!("Release {} has no downloadable assets", tag_name))?;
+
+    // Match the exact same installer/package used for this platform
+    let matched_asset = assets
+        .iter()
+        .find(|a| {
+            non_empty_str(a.get("name"))
+                .map(|n| n.eq_ignore_ascii_case(INSTALLER_ASSET_NAME))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            format!(
+                "Release {} does not contain matching installer '{}'",
+                tag_name, INSTALLER_ASSET_NAME
+            )
+        })?;
+
+    let asset_name = non_empty_str(matched_asset.get("name"))
+        .unwrap_or(INSTALLER_ASSET_NAME)
+        .to_string();
+    let download_url = non_empty_str(matched_asset.get("browser_download_url"))
+        .ok_or_else(|| "Release asset missing download URL".to_string())?
+        .to_string();
+    if !is_allowed_github_download_url(&download_url) {
+        return Err("Refused untrusted update download URL".to_string());
+    }
+    let asset_size = matched_asset
+        .get("size")
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+    let release_notes = non_empty_str(release_val.get("body"))
+        .unwrap_or("")
+        .lines()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(Some(UpdateReleaseInfo {
+        tag_name,
+        asset_name,
+        download_url,
+        asset_size,
+        release_notes,
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn escape_batch_percent(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_platform_installer_and_restart(
+    installer_path: &Path,
+    updater_dir: &Path,
+) -> Result<(), String> {
+    let current_exe =
+        env::current_exe().map_err(|e| format!("Could not resolve current executable: {}", e))?;
+    let install_dir = current_exe
+        .parent()
+        .ok_or_else(|| "Could not resolve installation directory".to_string())?;
+
+    let install_dir_str = install_dir
+        .display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string();
+    let installer_str = installer_path.display().to_string();
+    let current_exe_str = current_exe.display().to_string();
+    let updater_dir_str = updater_dir.display().to_string();
+    let pid = std::process::id();
+
+    let script_path = updater_dir.join("apply_update.cmd");
+    let script_content = format!(
+        "@echo off\r\n\
+         setlocal\r\n\
+         set \"COUNT=0\"\r\n\
+         :waitloop\r\n\
+         tasklist /FI \"PID eq {pid}\" /FO CSV /NH 2>NUL | findstr /C:\",\\\"{pid}\\\",\" >NUL\r\n\
+         if \"%ERRORLEVEL%\"==\"0\" (\r\n\
+           set /a COUNT+=1\r\n\
+           if %COUNT% LSS 15 (\r\n\
+             timeout /t 1 /nobreak >NUL\r\n\
+             goto waitloop\r\n\
+           )\r\n\
+         )\r\n\
+         \"{installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /DIR=\"{install_dir}\"\r\n\
+         del /f /q \"{installer}\" 2>NUL\r\n\
+         start \"\" \"{exe}\"\r\n\
+         (goto) 2>nul & del /f /q \"%~f0\" & rmdir /s /q \"{updater_dir}\" 2>nul\r\n",
+        pid = pid,
+        installer = escape_batch_percent(&installer_str),
+        install_dir = escape_batch_percent(&install_dir_str),
+        exe = escape_batch_percent(&current_exe_str),
+        updater_dir = escape_batch_percent(&updater_dir_str),
+    );
+
+    fs::write(&script_path, script_content)
+        .map_err(|e| format!("Failed to prepare Windows update script: {}", e))?;
+
+    Command::new("cmd.exe")
+        .args(["/C", &script_path.display().to_string()])
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to launch update helper: {}", e))?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_platform_installer_and_restart(
+    archive_path: &Path,
+    updater_dir: &Path,
+) -> Result<(), String> {
+    let current_exe =
+        env::current_exe().map_err(|e| format!("Could not resolve current executable: {}", e))?;
+    let extract_dir = updater_dir.join("extract");
+    fs::create_dir_all(&extract_dir)
+        .map_err(|e| format!("Failed to create extract directory: {}", e))?;
+
+    let status = Command::new("tar")
+        .args([
+            "-xzf",
+            &archive_path.display().to_string(),
+            "-C",
+            &extract_dir.display().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to extract update archive: {}", e))?;
+
+    if !status.success() {
+        return Err("Failed to extract downloaded update archive".to_string());
+    }
+
+    // Locate extracted 5KD binary
+    let mut extracted_bin: Option<PathBuf> = None;
+    if let Ok(entries) = fs::read_dir(&extract_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("5KD") {
+                        extracted_bin = Some(path);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let new_bin = extracted_bin
+        .ok_or_else(|| "Extracted update archive did not contain the 5KD binary".to_string())?;
+
+    let script_path = updater_dir.join("apply_update.sh");
+    let pid = std::process::id();
+    let exe_q = shell_quote(&current_exe.display().to_string());
+    let new_bin_q = shell_quote(&new_bin.display().to_string());
+    let updater_dir_q = shell_quote(&updater_dir.display().to_string());
+
+    let script_content = format!(
+        "#!/bin/sh\n\
+         PID={pid}\n\
+         i=0\n\
+         while kill -0 \"$PID\" 2>/dev/null && [ \"$i\" -lt 15 ]; do\n\
+           sleep 1\n\
+           i=$((i + 1))\n\
+         done\n\
+         cp -f {new_bin} {exe}.new && chmod +x {exe}.new && mv -f {exe}.new {exe}\n\
+         rm -rf {updater_dir}\n\
+         nohup {exe} >/dev/null 2>&1 &\n",
+        pid = pid,
+        new_bin = new_bin_q,
+        exe = exe_q,
+        updater_dir = updater_dir_q,
+    );
+
+    fs::write(&script_path, script_content)
+        .map_err(|e| format!("Failed to write Unix update script: {}", e))?;
+
+    Command::new("sh")
+        .arg(&script_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to launch update helper: {}", e))?;
+
+    Ok(())
+}
+
+/// Streams the matching GitHub installer directly inside the app, runs it silently,
+/// removes all temporary/unused installer files, and restarts the app automatically.
+fn download_and_install_update(
+    info: &UpdateReleaseInfo,
+    tx: &Sender<WorkerEvent>,
+    notifier: &UiNotifier,
+) -> Result<(), String> {
+    if !is_allowed_github_download_url(&info.download_url) {
+        return Err("Refused untrusted download URL".to_string());
+    }
+
+    cleanup_leftover_update_files();
+    let updater_dir = updater_temp_dir();
+    fs::create_dir_all(&updater_dir)
+        .map_err(|e| format!("Failed to create updater folder: {}", e))?;
+
+    let safe_asset = sanitize_filename(&info.asset_name, INSTALLER_ASSET_NAME);
+    let part_path = updater_dir.join(format!("{}.part", safe_asset));
+    let final_path = updater_dir.join(&safe_asset);
+
+    let dl_client = reqwest::blocking::Client::builder()
+        .user_agent(format!("5KD-Updater/{}", APP_VERSION))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("Failed to initialize download client: {}", e))?;
+
+    let mut resp = dl_client
+        .get(&info.download_url)
+        .header("Accept", "application/octet-stream")
+        .send()
+        .map_err(|e| format!("Failed to download update: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Update download failed with HTTP {}",
+            resp.status().as_u16()
+        ));
+    }
+
+    let total_bytes = resp.content_length().unwrap_or(info.asset_size);
+    let mut out_file = fs::File::create(&part_path)
+        .map_err(|e| format!("Failed to create temporary installer file: {}", e))?;
+
+    let mut buf = [0u8; 64 * 1024];
+    let mut downloaded: u64 = 0;
+    let mut last_emit = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        let n = resp
+            .read(&mut buf)
+            .map_err(|e| format!("Interrupted while downloading update: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        out_file
+            .write_all(&buf[..n])
+            .map_err(|e| format!("Failed writing update file: {}", e))?;
+        downloaded += n as u64;
+
+        if last_emit.elapsed() >= Duration::from_millis(80)
+            || (total_bytes > 0 && downloaded >= total_bytes)
+        {
+            last_emit = Instant::now();
+            let _ = tx.send(WorkerEvent::UpdateProgress {
+                tag_name: info.tag_name.clone(),
+                asset_name: info.asset_name.clone(),
+                downloaded,
+                total: total_bytes,
+            });
+            notifier.wake_throttled();
+        }
+    }
+
+    out_file
+        .flush()
+        .map_err(|e| format!("Failed flushing installer file: {}", e))?;
+    drop(out_file);
+
+    fs::rename(&part_path, &final_path)
+        .map_err(|e| format!("Failed finalizing installer file: {}", e))?;
+
+    let _ = tx.send(WorkerEvent::Log(format!(
+        "[updater] Downloaded {} ({}), installing silently and restarting...",
+        info.asset_name,
+        format_bytes(downloaded)
+    )));
+    notifier.wake_immediate();
+
+    spawn_platform_installer_and_restart(&final_path, &updater_dir)?;
+    Ok(())
+}
+
 struct FiveKdApp {
     current_tab: Tab,
     zoom_percent: u32,         // 100 to 150
@@ -1476,6 +1943,12 @@ struct FiveKdApp {
     container_ext: ContainerExt,
     output_path: String,
     paste_notice: Option<(String, Instant)>,
+
+    check_updates_on_launch: bool,
+    github_repo: String,
+    update_state: UpdateState,
+    update_banner_dismissed: bool,
+    should_exit_for_update: bool,
 
     active_downloads: Vec<DownloadItem>,
     completed_downloads: Vec<DownloadItem>,
@@ -1538,12 +2011,18 @@ impl FiveKdApp {
             style.spacing.scroll.bar_width = 6.0;
         });
 
+        // Remove any leftover installer or temporary update files from a prior update
+        cleanup_leftover_update_files();
+
         let cfg = load_app_config();
         let (tx, rx) = channel();
         let notifier = UiNotifier::new(cc.egui_ctx.clone());
 
         let mut logs = VecDeque::with_capacity(64);
-        logs.push_back("[info] 5KD - 5wi's Kick Downloader initialized.".to_string());
+        logs.push_back(format!(
+            "[info] 5KD - 5wi's Kick Downloader ({}) initialized.",
+            APP_VERSION
+        ));
         logs.push_back("[info] Integrated Kick VOD Extractor ready.".to_string());
         if !cfg.output_path.is_empty() {
             logs.push_back(format!(
@@ -1552,7 +2031,13 @@ impl FiveKdApp {
             ));
         }
 
-        Self {
+        let effective_repo = if !cfg.github_repo.trim().is_empty() {
+            cfg.github_repo.trim().to_string()
+        } else {
+            GITHUB_REPO.to_string()
+        };
+
+        let mut app = Self {
             current_tab: Tab::Downloads,
             zoom_percent: cfg.zoom_percent,
             applied_zoom_percent: 0, // Applies saved zoom_percent on the very first frame
@@ -1563,6 +2048,11 @@ impl FiveKdApp {
             container_ext: ContainerExt::from_str(&cfg.container_ext),
             output_path: cfg.output_path,
             paste_notice: None,
+            check_updates_on_launch: cfg.check_updates_on_launch,
+            github_repo: effective_repo,
+            update_state: UpdateState::Idle,
+            update_banner_dismissed: false,
+            should_exit_for_update: false,
             active_downloads: Vec::new(),
             completed_downloads: Vec::new(),
             terminal_logs: logs,
@@ -1570,7 +2060,13 @@ impl FiveKdApp {
             tx,
             rx,
             notifier,
+        };
+
+        if app.check_updates_on_launch && !app.github_repo.trim().is_empty() {
+            app.check_for_updates();
         }
+
+        app
     }
 
     fn persist_config(&self) {
@@ -1579,6 +2075,94 @@ impl FiveKdApp {
             zoom_percent: self.zoom_percent,
             resolution: self.resolution.short_label().to_string(),
             container_ext: self.container_ext.as_str().to_string(),
+            check_updates_on_launch: self.check_updates_on_launch,
+            github_repo: if self.github_repo.trim() == GITHUB_REPO {
+                String::new()
+            } else {
+                self.github_repo.trim().to_string()
+            },
+        });
+    }
+
+    fn check_for_updates(&mut self) {
+        if matches!(
+            self.update_state,
+            UpdateState::Checking | UpdateState::Downloading { .. } | UpdateState::Installing(_)
+        ) {
+            return;
+        }
+        let repo = self.github_repo.trim().to_string();
+        if repo.is_empty() {
+            self.update_state = UpdateState::Error(
+                "GitHub repository not configured yet. Enter owner/repo below.".to_string(),
+            );
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        self.update_banner_dismissed = false;
+        self.push_log(format!(
+            "[updater] Checking GitHub ({}) for newer releases...",
+            repo
+        ));
+
+        let tx = self.tx.clone();
+        let notifier = self.notifier.clone();
+        thread::spawn(move || {
+            let res = check_github_latest_release(&repo);
+            match &res {
+                Ok(Some(info)) => {
+                    let _ = tx.send(WorkerEvent::Log(format!(
+                        "[updater] Update available: {} ({})",
+                        info.tag_name, info.asset_name
+                    )));
+                }
+                Ok(None) => {
+                    let _ = tx.send(WorkerEvent::Log(format!(
+                        "[updater] 5KD is up to date ({}).",
+                        APP_VERSION
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerEvent::Log(format!("[updater error] {}", e)));
+                }
+            }
+            let _ = tx.send(WorkerEvent::UpdateChecked(res));
+            notifier.wake_immediate();
+        });
+    }
+
+    fn start_in_app_update(&mut self, info: UpdateReleaseInfo) {
+        if matches!(
+            self.update_state,
+            UpdateState::Downloading { .. } | UpdateState::Installing(_)
+        ) {
+            return;
+        }
+        self.persist_config();
+        self.update_state = UpdateState::Downloading {
+            tag_name: info.tag_name.clone(),
+            asset_name: info.asset_name.clone(),
+            downloaded: 0,
+            total: info.asset_size,
+        };
+        self.push_log(format!(
+            "[updater] Downloading {} ({}) directly inside 5KD...",
+            info.asset_name, info.tag_name
+        ));
+
+        let tx = self.tx.clone();
+        let notifier = self.notifier.clone();
+        thread::spawn(move || match download_and_install_update(&info, &tx, &notifier) {
+            Ok(()) => {
+                let _ = tx.send(WorkerEvent::UpdateReadyToRestart(info.tag_name));
+                notifier.wake_immediate();
+            }
+            Err(e) => {
+                cleanup_leftover_update_files();
+                let _ = tx.send(WorkerEvent::Log(format!("[updater error] {}", e)));
+                let _ = tx.send(WorkerEvent::UpdateFailed(e));
+                notifier.wake_immediate();
+            }
         });
     }
 
@@ -1906,6 +2490,38 @@ impl FiveKdApp {
                         self.completed_downloads.insert(0, item);
                     }
                 }
+                WorkerEvent::UpdateChecked(result) => match result {
+                    Ok(Some(info)) => {
+                        self.update_state = UpdateState::Available(info);
+                    }
+                    Ok(None) => {
+                        self.update_state = UpdateState::UpToDate(APP_VERSION.to_string());
+                    }
+                    Err(e) => {
+                        self.update_state = UpdateState::Error(e);
+                    }
+                },
+                WorkerEvent::UpdateProgress {
+                    tag_name,
+                    asset_name,
+                    downloaded,
+                    total,
+                } => {
+                    self.update_state = UpdateState::Downloading {
+                        tag_name,
+                        asset_name,
+                        downloaded,
+                        total,
+                    };
+                }
+                WorkerEvent::UpdateReadyToRestart(tag_name) => {
+                    self.update_state = UpdateState::Installing(tag_name);
+                    self.persist_config();
+                    self.should_exit_for_update = true;
+                }
+                WorkerEvent::UpdateFailed(err) => {
+                    self.update_state = UpdateState::Error(err);
+                }
             }
         }
     }
@@ -1997,6 +2613,11 @@ impl eframe::App for FiveKdApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
 
+        if self.should_exit_for_update {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         // Only mutate zoom factor when user changes zoom (zero overhead on steady frames)
         if self.zoom_percent != self.applied_zoom_percent {
             ctx.set_zoom_factor(self.zoom_percent as f32 / 100.0);
@@ -2044,11 +2665,15 @@ impl eframe::App for FiveKdApp {
                 ui.add_space(22.0);
 
                 // Primary Navigation Tabs
+                let has_update_badge = usize::from(matches!(
+                    self.update_state,
+                    UpdateState::Available(_) | UpdateState::Downloading { .. }
+                ));
                 let nav_items = [
                     (Tab::Downloads, "Downloads", self.active_downloads.len()),
                     (Tab::Terminal, "Terminal", self.terminal_logs.len()),
                     (Tab::Completed, "Completed", self.completed_downloads.len()),
-                    (Tab::About, "About", 0),
+                    (Tab::About, "About", has_update_badge),
                 ];
 
                 for (tab, label, count) in nav_items {
@@ -2203,7 +2828,72 @@ impl eframe::App for FiveKdApp {
                     .fill(BG_CANVAS)
                     .inner_margin(egui::Margin::symmetric(28.0, 24.0)),
             )
-            .show(ctx, |ui| match self.current_tab {
+            .show(ctx, |ui| {
+                // Compact in-app update banner when a newer release is found outside the About tab
+                if self.current_tab != Tab::About && !self.update_banner_dismissed {
+                    if let UpdateState::Available(info) = self.update_state.clone() {
+                        let mut trigger_install = false;
+                        egui::Frame::none()
+                            .fill(ACCENT_TINT)
+                            .rounding(Rounding::same(10.0))
+                            .stroke(Stroke::new(1.0, ACCENT_GREEN))
+                            .inner_margin(egui::Margin::symmetric(14.0, 9.0))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Update {} available",
+                                            info.tag_name
+                                        ))
+                                        .size(13.0)
+                                        .strong()
+                                        .color(ACCENT_GREEN),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("· {}", info.asset_name))
+                                            .size(11.5)
+                                            .family(FontFamily::Monospace)
+                                            .color(TEXT_MUTED),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let later_btn = styled_secondary_btn(
+                                                "Later",
+                                                TEXT_MUTED,
+                                                BORDER_HOVER,
+                                                Vec2::new(56.0, 28.0),
+                                            );
+                                            if ui.add(later_btn).clicked() {
+                                                self.update_banner_dismissed = true;
+                                            }
+                                            let upd_btn = egui::Button::new(
+                                                RichText::new("Update & Restart")
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(Color32::BLACK),
+                                            )
+                                            .fill(ACCENT_GREEN)
+                                            .stroke(Stroke::new(1.0, ACCENT_GREEN))
+                                            .rounding(Rounding::same(7.0))
+                                            .min_size(Vec2::new(124.0, 28.0));
+                                            if ui.add(upd_btn).clicked() {
+                                                trigger_install = true;
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        if trigger_install {
+                            self.current_tab = Tab::About;
+                            self.start_in_app_update(info);
+                        }
+                        ui.add_space(12.0);
+                    }
+                }
+
+                match self.current_tab {
                 Tab::Downloads => {
                     let folder_selected = self.has_chosen_folder();
                     let can_download = folder_selected && !self.url_input.trim().is_empty();
@@ -2740,12 +3430,14 @@ impl eframe::App for FiveKdApp {
                                         if let Some(line) = self.terminal_logs.get(idx) {
                                             let line_color = if line.contains("[error]")
                                                 || line.contains("[extractor error]")
+                                                || line.contains("[updater error]")
                                             {
                                                 STATUS_FAILED
                                             } else if line.contains("[cancel]") {
                                                 STATUS_CANCELED
                                             } else if line.starts_with(">>>")
                                                 || line.contains("Extracted '")
+                                                || line.contains("[updater] Update available:")
                                             {
                                                 ACCENT_GREEN
                                             } else {
@@ -2813,87 +3505,351 @@ impl eframe::App for FiveKdApp {
                 }
 
                 Tab::About => {
-                    ui.horizontal(|ui| {
-                        draw_brand_mark(ui, 40.0);
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("about_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("5KD - 5wi's Kick Downloader")
-                                        .size(18.5)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                );
-                                ui.label(
-                                    RichText::new("· 1.0v")
-                                        .size(12.5)
-                                        .family(FontFamily::Monospace)
-                                        .color(ACCENT_GREEN),
-                                );
+                                draw_brand_mark(ui, 40.0);
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("5KD - 5wi's Kick Downloader")
+                                                .size(18.5)
+                                                .strong()
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("· {}", APP_VERSION))
+                                                .size(12.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(ACCENT_GREEN),
+                                        );
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Lightweight Kick.com VOD and clip downloader written in Rust.",
+                                        )
+                                        .size(13.0)
+                                        .color(TEXT_MUTED),
+                                    );
+                                });
                             });
-                            ui.label(
-                                RichText::new(
-                                    "Lightweight Kick.com VOD and clip downloader written in Rust.",
-                                )
-                                .size(13.0)
-                                .color(TEXT_MUTED),
-                            );
-                        });
-                    });
 
-                    ui.add_space(18.0);
+                            ui.add_space(18.0);
 
-                    egui::Frame::none()
-                        .fill(BG_SURFACE)
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-                        .inner_margin(egui::Margin::same(16.0))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.label(
-                                RichText::new("Architecture & Engine")
-                                    .size(14.5)
-                                    .strong()
-                                    .color(TEXT_PRIMARY),
-                            );
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(
-                                    "Built natively in Rust using eframe/egui, reqwest (rustls), rfd, arboard, yt-dlp, and ffmpeg for low-resource HLS stream downloading and lossless time slicing.",
-                                )
-                                .size(13.0)
-                                .color(TEXT_MUTED),
-                            );
-                        });
+                            // Software Updates Card (in-app GitHub release check + direct silent installer update)
+                            let mut trigger_check = false;
+                            let mut trigger_update_info: Option<UpdateReleaseInfo> = None;
+                            let mut persist_update_prefs = false;
 
-                    ui.add_space(12.0);
+                            egui::Frame::none()
+                                .fill(BG_SURFACE)
+                                .rounding(Rounding::same(10.0))
+                                .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                .inner_margin(egui::Margin::same(16.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new("Software Updates")
+                                                    .size(14.5)
+                                                    .strong()
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Installed: {} · {}",
+                                                    APP_VERSION, INSTALLER_ASSET_NAME
+                                                ))
+                                                .size(11.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(TEXT_MUTED),
+                                            );
+                                        });
 
-                    egui::Frame::none()
-                        .fill(BG_SURFACE)
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-                        .inner_margin(egui::Margin::same(16.0))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.label(
-                                RichText::new("Credits & Acknowledgments")
-                                    .size(14.5)
-                                    .strong()
-                                    .color(TEXT_PRIMARY),
-                            );
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(
-                                    "M3U8 URL Extractor logic powered by kickvod-extractor by mortyobnoxious:",
-                                )
-                                .size(13.0)
-                                .color(TEXT_MUTED),
-                            );
-                            ui.add_space(4.0);
-                            ui.hyperlink("https://github.com/mortyobnoxious/kickvod-extractor");
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let busy = matches!(
+                                                    self.update_state,
+                                                    UpdateState::Checking
+                                                        | UpdateState::Downloading { .. }
+                                                        | UpdateState::Installing(_)
+                                                );
+                                                if let UpdateState::Available(info) =
+                                                    self.update_state.clone()
+                                                {
+                                                    let install_clicked = ui
+                                                        .scope(|ui| {
+                                                            let w = &mut ui.visuals_mut().widgets;
+                                                            w.hovered.bg_fill =
+                                                                Color32::from_rgb(38, 255, 39);
+                                                            w.hovered.weak_bg_fill =
+                                                                Color32::from_rgb(38, 255, 39);
+                                                            w.hovered.bg_stroke = Stroke::new(
+                                                                1.0,
+                                                                Color32::from_rgb(38, 255, 39),
+                                                            );
+                                                            let install_btn = egui::Button::new(
+                                                                RichText::new("Update & Restart")
+                                                                    .size(12.5)
+                                                                    .strong()
+                                                                    .color(Color32::BLACK),
+                                                            )
+                                                            .fill(ACCENT_GREEN)
+                                                            .stroke(Stroke::new(1.0, ACCENT_GREEN))
+                                                            .rounding(Rounding::same(7.0))
+                                                            .min_size(Vec2::new(132.0, 30.0));
+                                                            ui.add(install_btn).clicked()
+                                                        })
+                                                        .inner;
+                                                    if install_clicked {
+                                                        trigger_update_info = Some(info);
+                                                    }
+                                                    ui.add_space(6.0);
+                                                }
+
+                                                let check_label = if matches!(
+                                                    self.update_state,
+                                                    UpdateState::Checking
+                                                ) {
+                                                    "Checking..."
+                                                } else {
+                                                    "Check for Updates"
+                                                };
+                                                let check_btn = styled_secondary_btn(
+                                                    check_label,
+                                                    if busy { TEXT_MUTED } else { TEXT_PRIMARY },
+                                                    BORDER_HOVER,
+                                                    Vec2::new(128.0, 30.0),
+                                                );
+                                                if ui.add_enabled(!busy, check_btn).clicked() {
+                                                    trigger_check = true;
+                                                }
+                                            },
+                                        );
+                                    });
+
+                                    ui.add_space(10.0);
+
+                                    // Auto-check on launch checkbox
+                                    if ui
+                                        .checkbox(
+                                            &mut self.check_updates_on_launch,
+                                            RichText::new("Check for updates when app launches")
+                                                .size(13.0)
+                                                .color(TEXT_PRIMARY),
+                                        )
+                                        .changed()
+                                    {
+                                        persist_update_prefs = true;
+                                    }
+
+                                    // Show GitHub repo field only when built locally outside a GitHub repo
+                                    if GITHUB_REPO.is_empty() {
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new("GitHub Repo")
+                                                    .size(12.0)
+                                                    .color(TEXT_MUTED),
+                                            );
+                                            let resp = ui.add(
+                                                egui::TextEdit::singleline(&mut self.github_repo)
+                                                    .hint_text("owner/repo")
+                                                    .desired_width(220.0)
+                                                    .font(FontId::monospace(12.0)),
+                                            );
+                                            if resp.lost_focus() {
+                                                persist_update_prefs = true;
+                                            }
+                                        });
+                                    }
+
+                                    // Live updater status & direct download progress
+                                    match &self.update_state {
+                                        UpdateState::Idle => {}
+                                        UpdateState::Checking => {
+                                            ui.add_space(10.0);
+                                            ui.label(
+                                                RichText::new(
+                                                    "Checking GitHub Releases for a newer version...",
+                                                )
+                                                .size(12.0)
+                                                .family(FontFamily::Monospace)
+                                                .color(TEXT_MUTED),
+                                            );
+                                        }
+                                        UpdateState::UpToDate(ver) => {
+                                            ui.add_space(10.0);
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "You are on the latest version ({}).",
+                                                    ver
+                                                ))
+                                                .size(12.0)
+                                                .family(FontFamily::Monospace)
+                                                .color(ACCENT_GREEN),
+                                            );
+                                        }
+                                        UpdateState::Available(info) => {
+                                            ui.add_space(10.0);
+                                            let size_suffix = if info.asset_size > 0 {
+                                                format!(" ({})", format_bytes(info.asset_size))
+                                            } else {
+                                                String::new()
+                                            };
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "New release {} ready — {}{}",
+                                                    info.tag_name, info.asset_name, size_suffix
+                                                ))
+                                                .size(12.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(ACCENT_GREEN),
+                                            );
+                                            if !info.release_notes.is_empty() {
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new(&info.release_notes)
+                                                        .size(11.5)
+                                                        .color(TEXT_MUTED),
+                                                );
+                                            }
+                                        }
+                                        UpdateState::Downloading {
+                                            tag_name,
+                                            asset_name,
+                                            downloaded,
+                                            total,
+                                        } => {
+                                            ui.add_space(10.0);
+                                            let progress = if *total > 0 {
+                                                (*downloaded as f32 / *total as f32)
+                                                    .clamp(0.0, 1.0)
+                                            } else {
+                                                0.15
+                                            };
+                                            draw_progress_row(ui, progress);
+                                            ui.add_space(4.0);
+                                            let dl_status = if *total > 0 {
+                                                format!(
+                                                    "Downloading {} ({}) — {} / {}",
+                                                    asset_name,
+                                                    tag_name,
+                                                    format_bytes(*downloaded),
+                                                    format_bytes(*total)
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Downloading {} ({}) — {}",
+                                                    asset_name,
+                                                    tag_name,
+                                                    format_bytes(*downloaded)
+                                                )
+                                            };
+                                            ui.label(
+                                                RichText::new(dl_status)
+                                                    .size(11.5)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(TEXT_MUTED),
+                                            );
+                                        }
+                                        UpdateState::Installing(tag_name) => {
+                                            ui.add_space(10.0);
+                                            draw_progress_row(ui, 1.0);
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Installing {}, cleaning up temporary files, and restarting...",
+                                                    tag_name
+                                                ))
+                                                .size(12.0)
+                                                .family(FontFamily::Monospace)
+                                                .color(ACCENT_GREEN),
+                                            );
+                                        }
+                                        UpdateState::Error(err) => {
+                                            ui.add_space(10.0);
+                                            ui.label(
+                                                RichText::new(err)
+                                                    .size(12.0)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(STATUS_FAILED),
+                                            );
+                                        }
+                                    }
+                                });
+
+                            if persist_update_prefs {
+                                self.persist_config();
+                            }
+                            if trigger_check {
+                                self.check_for_updates();
+                            }
+                            if let Some(info) = trigger_update_info {
+                                self.start_in_app_update(info);
+                            }
+
+                            ui.add_space(12.0);
+
+                            egui::Frame::none()
+                                .fill(BG_SURFACE)
+                                .rounding(Rounding::same(10.0))
+                                .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                .inner_margin(egui::Margin::same(16.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.label(
+                                        RichText::new("Architecture & Engine")
+                                            .size(14.5)
+                                            .strong()
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "Built natively in Rust using eframe/egui, reqwest (rustls), rfd, arboard, yt-dlp, and ffmpeg for low-resource HLS stream downloading and lossless time slicing.",
+                                        )
+                                        .size(13.0)
+                                        .color(TEXT_MUTED),
+                                    );
+                                });
+
+                            ui.add_space(12.0);
+
+                            egui::Frame::none()
+                                .fill(BG_SURFACE)
+                                .rounding(Rounding::same(10.0))
+                                .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                .inner_margin(egui::Margin::same(16.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.label(
+                                        RichText::new("Credits & Acknowledgments")
+                                            .size(14.5)
+                                            .strong()
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "M3U8 URL Extractor logic powered by kickvod-extractor by mortyobnoxious:",
+                                        )
+                                        .size(13.0)
+                                        .color(TEXT_MUTED),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.hyperlink(
+                                        "https://github.com/mortyobnoxious/kickvod-extractor",
+                                    );
+                                });
                         });
                 }
-            });
+            }});
     }
 }
 

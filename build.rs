@@ -1,5 +1,6 @@
-#[cfg(windows)]
 use std::env;
+use std::process::Command;
+
 #[cfg(windows)]
 use std::fs::File;
 #[cfg(windows)]
@@ -95,8 +96,97 @@ fn generate_ico_bytes() -> Vec<u8> {
     buf
 }
 
-#[cfg(windows)]
+fn parse_github_repo_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("http://github.com/") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else {
+        return None;
+    };
+
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim();
+    if !owner.is_empty() && !repo.is_empty() {
+        Some(format!("{}/{}", owner, repo))
+    } else {
+        None
+    }
+}
+
+fn detect_github_repo() -> String {
+    for key in ["FIVEKD_GITHUB_REPO", "GITHUB_REPOSITORY"] {
+        if let Ok(val) = env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && trimmed.contains('/') {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    if let Ok(output) = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+    {
+        if output.status.success() {
+            let remote = String::from_utf8_lossy(&output.stdout);
+            if let Some(repo) = parse_github_repo_from_url(&remote) {
+                return repo;
+            }
+        }
+    }
+
+    String::new()
+}
+
+fn detect_app_version() -> String {
+    if let Ok(tag) = env::var("FIVEKD_RELEASE_TAG") {
+        let trimmed = tag.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.0.0".to_string())
+}
+
+fn detect_installer_asset() -> String {
+    if let Ok(asset) = env::var("FIVEKD_INSTALLER_ASSET") {
+        let trimmed = asset.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    match (os.as_str(), arch.as_str()) {
+        ("windows", "aarch64") => "5KD-windows-arm64-setup.exe".to_string(),
+        ("windows", _) => "5KD-windows-x86_64-setup.exe".to_string(),
+        ("macos", "aarch64") => "5KD-macos-arm64.tar.gz".to_string(),
+        ("macos", _) => "5KD-macos-x86_64.tar.gz".to_string(),
+        _ => "5KD-linux-x86_64.tar.gz".to_string(),
+    }
+}
+
 fn main() {
+    println!("cargo:rerun-if-env-changed=FIVEKD_GITHUB_REPO");
+    println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
+    println!("cargo:rerun-if-env-changed=FIVEKD_RELEASE_TAG");
+    println!("cargo:rerun-if-env-changed=FIVEKD_INSTALLER_ASSET");
+
+    println!("cargo:rustc-env=FIVEKD_GITHUB_REPO={}", detect_github_repo());
+    println!("cargo:rustc-env=FIVEKD_APP_VERSION={}", detect_app_version());
+    println!(
+        "cargo:rustc-env=FIVEKD_INSTALLER_ASSET={}",
+        detect_installer_asset()
+    );
+
+    #[cfg(windows)]
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
         let ico_bytes = generate_ico_bytes();
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -116,8 +206,3 @@ fn main() {
         }
     }
 }
-
-#[cfg(not(windows))]
-fn main() {}
-
-
