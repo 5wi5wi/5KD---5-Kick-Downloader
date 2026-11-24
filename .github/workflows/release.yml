@@ -26,19 +26,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform_name: Windows x86_64
+          - platform_name: Windows x86_64 Installer
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bin_name: 5KD.exe
-            asset_name: 5KD-windows-x86_64.exe
-            archive_name: 5KD-windows-x86_64.zip
+            setup_base: 5KD-windows-x86_64-setup
+            iss_arch: x64compatible
 
-          - platform_name: Windows ARM64
+          - platform_name: Windows ARM64 Installer
             os: windows-latest
             target: aarch64-pc-windows-msvc
             bin_name: 5KD.exe
-            asset_name: 5KD-windows-arm64.exe
-            archive_name: 5KD-windows-arm64.zip
+            setup_base: 5KD-windows-arm64-setup
+            iss_arch: arm64
 
           - platform_name: Linux x86_64
             os: ubuntu-latest
@@ -92,27 +92,34 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} || cargo build --release --target ${{ matrix.target }}
 
-      - name: Package Windows release assets
+      - name: Compile Windows Setup Wizard Installer (Inno Setup)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $src = "target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
-          Copy-Item $src "dist/${{ matrix.asset_name }}"
-          if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") {
-            Copy-Item $src "dist/5KD.exe"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
           }
-          Compress-Archive -Path "dist/${{ matrix.asset_name }}" -DestinationPath "dist/${{ matrix.archive_name }}" -Force
+          $srcExe = "target\${{ matrix.target }}\release\${{ matrix.bin_name }}"
+          & $iscc "installer.iss" `
+            "/DMySourceExe=$srcExe" `
+            "/DMyOutputDir=dist" `
+            "/DMyOutputBaseFilename=${{ matrix.setup_base }}" `
+            "/DMyArchMode=${{ matrix.iss_arch }}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+          }
 
-      - name: Package Unix release assets (Linux & macOS)
+      - name: Package Unix release archive (Linux & macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p dist
+          mkdir -p staging dist
           SRC="target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
           chmod +x "$SRC"
-          cp "$SRC" "dist/${{ matrix.asset_name }}"
-          tar -czf "dist/${{ matrix.archive_name }}" -C dist "${{ matrix.asset_name }}"
+          cp "$SRC" "staging/${{ matrix.asset_name }}"
+          tar -czf "dist/${{ matrix.archive_name }}" -C staging "${{ matrix.asset_name }}"
 
       - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
@@ -152,6 +159,26 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Remove legacy portable .exe assets from release page
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve_tag.outputs.tag }}
+        run: |
+          LEGACY_ASSETS=(
+            "5KD.exe"
+            "5KD-windows-x86_64.exe"
+            "5KD-windows-arm64.exe"
+            "5KD-windows-x86_64.zip"
+            "5KD-windows-arm64.zip"
+            "5KD-linux-x86_64"
+            "5KD-macos-arm64"
+            "5KD-macos-x86_64"
+          )
+          for asset in "${LEGACY_ASSETS[@]}"; do
+            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes 2>/dev/null || true
+          done
+
       - name: Create or Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -160,19 +187,20 @@ jobs:
           body: |
             ## 5KD — 5wi's Kick Downloader `${{ steps.resolve_tag.outputs.tag }}`
 
-            ### Precompiled Binaries
-            | Platform | Architecture | Direct Binary | Archive |
-            | :--- | :--- | :--- | :--- |
-            | **Windows** | x86_64 (64-bit) | `5KD-windows-x86_64.exe` / `5KD.exe` | `5KD-windows-x86_64.zip` |
-            | **Windows** | ARM64 | `5KD-windows-arm64.exe` | `5KD-windows-arm64.zip` |
-            | **Linux** | x86_64 (64-bit) | `5KD-linux-x86_64` | `5KD-linux-x86_64.tar.gz` |
-            | **macOS** | Apple Silicon (M1–M4) | `5KD-macos-arm64` | `5KD-macos-arm64.tar.gz` |
-            | **macOS** | Intel (x86_64) | `5KD-macos-x86_64` | `5KD-macos-x86_64.tar.gz` |
+            ### Installers & Packages
+            | Platform | Architecture | Package |
+            | :--- | :--- | :--- |
+            | **Windows** | x86_64 (64-bit) | `5KD-windows-x86_64-setup.exe` *(Windows Setup Wizard Installer)* |
+            | **Windows** | ARM64 | `5KD-windows-arm64-setup.exe` *(Windows Setup Wizard Installer)* |
+            | **Linux** | x86_64 (64-bit) | `5KD-linux-x86_64.tar.gz` |
+            | **macOS** | Apple Silicon (M1–M4) | `5KD-macos-arm64.tar.gz` |
+            | **macOS** | Intel (x86_64) | `5KD-macos-x86_64.tar.gz` |
 
             ### Highlights
-            - **Native Rust Desktop App**: Pure-black `#000000` UI with `#00E701` Kick green accents, geometric vector icons, event-driven `0%` idle CPU rendering, and virtualized terminal output.
+            - **Fast Windows Setup Wizard Installer**: Native LZMA2-compressed installer with Start Menu shortcut, optional Desktop shortcut, embedded `#00E701` icon, and uninstaller support.
+            - **VOD & Clip Title File Naming**: Automatically names downloaded files after the actual Kick VOD or Clip title.
             - **Persistent Output Folder**: Automatically remembers your chosen output folder, quality, container format, and zoom level across restarts.
-            - **Integrated Kick VOD M3U8 Extractor**: Resolves `v1/video/{uuid}`, UUIDv7 `v2/channels/{user}/videos`, and CDN prefixes (`prefixes.json`) with silent background fallbacks.
+            - **Integrated Kick VOD & Clip Extractor**: Resolves `v1/video/{uuid}`, UUIDv7 `v2/channels/{user}/videos`, `v2/clips/{clip_id}`, and CDN prefixes (`prefixes.json`) with silent background fallbacks.
             - **Multi-Threaded HLS Engine**: Powered by `yt-dlp` (`-N 8`) and `ffmpeg` with lossless time slicing (`-ss` / `-to`).
 
             ### Requirements

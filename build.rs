@@ -98,17 +98,26 @@ fn generate_ico_bytes() -> Vec<u8> {
 #[cfg(windows)]
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
+        let ico_bytes = generate_ico_bytes();
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let ico_path = out_dir.join("app_icon.ico");
         if let Ok(mut file) = File::create(&ico_path) {
-            let _ = file.write_all(&generate_ico_bytes());
+            let _ = file.write_all(&ico_bytes);
             let mut res = winres::WindowsResource::new();
             res.set_icon(ico_path.to_str().unwrap());
             let _ = res.compile();
+        }
+        if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+            let target_dir = PathBuf::from(manifest_dir).join("target");
+            let _ = std::fs::create_dir_all(&target_dir);
+            if let Ok(mut target_ico) = File::create(target_dir.join("app_icon.ico")) {
+                let _ = target_ico.write_all(&ico_bytes);
+            }
         }
     }
 }
 
 #[cfg(not(windows))]
 fn main() {}
+
 

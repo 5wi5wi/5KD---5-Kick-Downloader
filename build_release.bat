@@ -1,26 +1,36 @@
 @echo off
-title 5KD - Release 1.0v EXE Builder
+title 5KD - Release Installer Builder
 echo ========================================================
-echo   Building 5KD Release 1.0v (Optimized Native Rust EXE)
+echo   Building 5KD Release (Native Rust + Setup Installer)
 echo ========================================================
 echo.
 
 cargo build --release
 if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo [ERROR] Build failed. Ensure Rust (cargo) is installed.
+    echo [ERROR] Cargo build failed. Ensure Rust (cargo) is installed.
     pause
     exit /b %ERRORLEVEL%
 )
 
-if not exist "release\1.0v" mkdir "release\1.0v"
-copy /Y "target\release\5KD.exe" "release\1.0v\5KD.exe" >nul
-copy /Y "target\release\5KD.exe" "release\5KD.exe" >nul
+if not exist "dist" mkdir "dist"
 
-echo.
-echo ========================================================
-echo   SUCCESS! Release 1.0v executable created at:
-echo   %~dp0release\1.0v\5KD.exe
-echo ========================================================
-explorer.exe "%~dp0release\1.0v"
+set "ISCC_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+if exist "%ISCC_PATH%" (
+    echo.
+    echo Compiling Windows Setup Wizard Installer...
+    "%ISCC_PATH%" "installer.iss" "/DMySourceExe=target\release\5KD.exe" "/DMyOutputDir=dist" "/DMyOutputBaseFilename=5KD-windows-x86_64-setup"
+    echo.
+    echo ========================================================
+    echo   SUCCESS! Windows Setup Wizard Installer created at:
+    echo   %~dp0dist\5KD-windows-x86_64-setup.exe
+    echo ========================================================
+    explorer.exe "%~dp0dist"
+) else (
+    copy /Y "target\release\5KD.exe" "dist\5KD.exe" >nul
+    echo.
+    echo [INFO] Inno Setup 6 not found at "%ISCC_PATH%".
+    echo   Copied compiled binary to: %~dp0dist\5KD.exe
+    explorer.exe "%~dp0dist"
+)
 pause
