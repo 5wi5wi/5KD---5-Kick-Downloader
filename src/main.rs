@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -50,26 +50,16 @@ const ACCENT_HOVER_BG: Color32 = Color32::from_rgb(6, 26, 8);
 const STATUS_FAILED: Color32 = Color32::from_rgb(248, 113, 113); // #F87171
 const STATUS_CANCELED: Color32 = Color32::from_rgb(251, 191, 36); // #FBBF24
 
-// Window icon grid (used once at startup for OS taskbar/titlebar icon)
-const ICON_5_GRID: [&str; 18] = [
-    "################",
-    "################",
-    "################",
-    "####............",
-    "####............",
-    "####............",
-    "############....",
-    "############....",
-    "##############..",
-    "..........#####.",
-    "..........######",
-    "............####",
-    "####......######",
-    "####......######",
-    "################",
-    ".##############.",
-    "..############..",
-    "..############..",
+// Shared geometric "5" polyline used for both the in-app brand mark and OS window/taskbar icon
+const BRAND_5_PTS: [(f32, f32); 8] = [
+    (0.69, 0.27),
+    (0.34, 0.27),
+    (0.34, 0.49),
+    (0.61, 0.49),
+    (0.69, 0.56),
+    (0.69, 0.68),
+    (0.61, 0.74),
+    (0.33, 0.74),
 ];
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -300,6 +290,7 @@ struct ExtractedVodMeta {
     channel_slug: String,
     session_title: String,
     duration_formatted: String,
+    duration_secs: Option<f64>,
     source_type: String,
 }
 
@@ -895,10 +886,11 @@ fn ytdlp_extract_kick_fallback(
         .or_else(|| non_empty_str(val.get("fulltitle")))
         .unwrap_or(&channel_slug)
         .to_string();
-    let duration_secs = val
+    let duration_f64 = val
         .get("duration")
-        .and_then(|d| d.as_u64().or_else(|| d.as_f64().map(|f| f as u64)))
-        .unwrap_or(0);
+        .and_then(|d| d.as_f64().or_else(|| d.as_u64().map(|u| u as f64)))
+        .filter(|&d| d.is_finite() && d > 0.0);
+    let duration_secs = duration_f64.map(|f| f as u64).unwrap_or(0);
     let duration_formatted = if duration_secs > 0 {
         format!(
             "{:02}:{:02}:{:02}",
@@ -915,6 +907,7 @@ fn ytdlp_extract_kick_fallback(
         channel_slug,
         session_title,
         duration_formatted,
+        duration_secs: duration_f64,
         source_type: "yt-dlp fallback".to_string(),
     })
 }
@@ -955,10 +948,11 @@ fn extract_kick_clip(
                 .unwrap_or(clip_id)
                 .to_string();
 
-            let duration_secs = clip_obj
+            let duration_f64 = clip_obj
                 .get("duration")
-                .and_then(|d| d.as_u64())
-                .unwrap_or(0);
+                .and_then(|d| d.as_f64().or_else(|| d.as_u64().map(|u| u as f64)))
+                .filter(|&d| d.is_finite() && d > 0.0);
+            let duration_secs = duration_f64.map(|f| f as u64).unwrap_or(0);
             let duration_formatted = if duration_secs > 0 {
                 format!(
                     "{:02}:{:02}:{:02}",
@@ -975,6 +969,7 @@ fn extract_kick_clip(
                 channel_slug,
                 session_title,
                 duration_formatted,
+                duration_secs: duration_f64,
                 source_type: "Kick Clip API".to_string(),
             });
         }
@@ -1004,6 +999,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
             channel_slug: "kick_stream".to_string(),
             session_title: fallback_title,
             duration_formatted: "Live/VOD".to_string(),
+            duration_secs: None,
             source_type: "Direct M3U8 URL".to_string(),
         });
     }
@@ -1216,6 +1212,12 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
         "Full VOD".to_string()
     };
 
+    let duration_secs_opt = if total_secs > 0 {
+        Some(total_secs as f64)
+    } else {
+        None
+    };
+
     // 2. Direct source URL from Kick API (v1 or v2)
     let direct_source = non_empty_str(vod.get("source")).or_else(|| {
         non_empty_str(v2_matched_obj.as_ref().and_then(|m| m.get("source")))
@@ -1227,6 +1229,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
             channel_slug,
             session_title,
             duration_formatted,
+            duration_secs: duration_secs_opt,
             source_type: "Source URL from API".to_string(),
         });
     }
@@ -1286,6 +1289,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                 channel_slug,
                 session_title,
                 duration_formatted,
+                duration_secs: duration_secs_opt,
                 source_type: "Direct URL (no prefix)".to_string(),
             });
         }
@@ -1305,6 +1309,7 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                     channel_slug,
                     session_title,
                     duration_formatted,
+                    duration_secs: duration_secs_opt,
                     source_type: format!("Found with prefix: {}", prefix),
                 });
             }
@@ -1312,6 +1317,649 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
     }
 
     Err("No working M3U8 URL found with available prefixes".to_string())
+}
+
+#[derive(Clone, Copy, Default)]
+struct StreamProbeInfo {
+    duration_secs: Option<f64>,
+    fps: Option<f64>,
+    total_frames: Option<u64>,
+    exact_frame_count: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ProgressTarget {
+    duration_secs: Option<f64>,
+    fps: Option<f64>,
+    total_frames: Option<u64>,
+    exact_frame_count: bool,
+    start_secs: Option<f64>,
+    end_secs: Option<f64>,
+    audio_only: bool,
+}
+
+impl ProgressTarget {
+    fn update_from_stream_duration(&mut self, full_secs: f64) {
+        if !full_secs.is_finite() || full_secs <= 0.0 {
+            return;
+        }
+        let target = match (self.start_secs, self.end_secs) {
+            (Some(s), Some(e)) if e > s => Some((e - s).min(full_secs)),
+            (None, Some(e)) if e > 0.0 => Some(e.min(full_secs)),
+            (Some(s), None) if full_secs > s => Some(full_secs - s),
+            (None, None) => Some(full_secs),
+            _ => Some(full_secs),
+        };
+        if let Some(d) = target.filter(|&v| v > 0.0) {
+            self.duration_secs = Some(d);
+            if !self.audio_only && !self.exact_frame_count {
+                if let Some(fps) = self.fps.filter(|&f| f > 0.0) {
+                    self.total_frames = Some((d * fps).round() as u64);
+                }
+            }
+        }
+    }
+
+    fn update_fps(&mut self, fps: f64) {
+        if !fps.is_finite() || fps <= 0.0 || fps > 240.0 || self.audio_only {
+            return;
+        }
+        self.fps = Some(fps);
+        if !self.exact_frame_count {
+            if let Some(d) = self.duration_secs.filter(|&v| v > 0.0) {
+                self.total_frames = Some((d * fps).round() as u64);
+            }
+        }
+    }
+}
+
+fn parse_hms_to_secs(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("N/A") || s.starts_with('-') {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    let secs = match parts.len() {
+        3 => {
+            let h: f64 = parts[0].parse().ok()?;
+            let m: f64 = parts[1].parse().ok()?;
+            let sec: f64 = parts[2].parse().ok()?;
+            h * 3600.0 + m * 60.0 + sec
+        }
+        2 => {
+            let m: f64 = parts[0].parse().ok()?;
+            let sec: f64 = parts[1].parse().ok()?;
+            m * 60.0 + sec
+        }
+        1 => parts[0].parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if secs.is_finite() && secs >= 0.0 {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
+fn format_secs_hms(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    format!(
+        "{:02}:{:02}:{:02}",
+        total / 3600,
+        (total % 3600) / 60,
+        total % 60
+    )
+}
+
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+fn parse_rational_fps(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if s.is_empty() || s == "0/0" || s.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    let fps = if let Some((num, den)) = s.split_once('/') {
+        let n: f64 = num.trim().parse().ok()?;
+        let d: f64 = den.trim().parse().ok()?;
+        if d <= 0.0 {
+            return None;
+        }
+        n / d
+    } else {
+        s.parse::<f64>().ok()?
+    };
+    if fps.is_finite() && fps > 0.5 && fps <= 240.0 {
+        Some(fps)
+    } else {
+        None
+    }
+}
+
+fn resolve_relative_url(base_url: &str, relative: &str) -> String {
+    let rel = relative.trim();
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return rel.to_string();
+    }
+    let base_no_q = base_url.split(&['?', '#'][..]).next().unwrap_or(base_url);
+    if rel.starts_with('/') {
+        if let Some(scheme_pos) = base_no_q.find("://") {
+            let after_scheme = &base_no_q[scheme_pos + 3..];
+            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+            let origin = &base_no_q[..scheme_pos + 3 + host_end];
+            return format!("{}{}", origin, rel);
+        }
+    }
+    if let Some(slash) = base_no_q.rfind('/') {
+        format!("{}{}", &base_no_q[..=slash], rel)
+    } else {
+        rel.to_string()
+    }
+}
+
+fn fetch_text_with_kick_headers(url: &str) -> Option<String> {
+    if let Ok(client) = shared_http_client() {
+        if let Ok(resp) = client
+            .get(url)
+            .header("Origin", "https://kick.com")
+            .header("Referer", "https://kick.com/")
+            .send()
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.text() {
+                    if !body.trim().is_empty() {
+                        return Some(body);
+                    }
+                }
+            }
+        }
+        let proxied = format!("{}{}", VIDDASTRAGE_PROXY, encode_uri_component(url));
+        if let Ok(resp) = client.get(&proxied).send() {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.text() {
+                    if !body.trim().is_empty() {
+                        return Some(body);
+                    }
+                }
+            }
+        }
+    }
+    curl_fetch_text(url)
+}
+
+fn parse_m3u8_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{}=", key);
+    let mut search = attrs;
+    while let Some(pos) = search.find(&needle) {
+        let boundary_ok = pos == 0 || matches!(search.as_bytes()[pos - 1], b',' | b' ' | b':');
+        let rest = &search[pos + needle.len()..];
+        if boundary_ok {
+            if let Some(stripped) = rest.strip_prefix('"') {
+                let end = stripped.find('"').unwrap_or(stripped.len());
+                return Some(&stripped[..end]);
+            }
+            let end = rest.find(',').unwrap_or(rest.len());
+            return Some(rest[..end].trim());
+        }
+        search = rest;
+    }
+    None
+}
+
+fn infer_fps_from_variant_uri(uri: &str) -> Option<f64> {
+    let lower = uri.to_ascii_lowercase();
+    if lower.contains("p60") || lower.contains("60fps") {
+        Some(60.0)
+    } else if lower.contains("p50") || lower.contains("50fps") {
+        Some(50.0)
+    } else if lower.contains("p30") || lower.contains("30fps") {
+        Some(30.0)
+    } else {
+        None
+    }
+}
+
+fn probe_hls_stream(m3u8_url: &str, res: Resolution) -> StreamProbeInfo {
+    let mut info = StreamProbeInfo::default();
+    let Some(master_text) = fetch_text_with_kick_headers(m3u8_url) else {
+        return info;
+    };
+    if !master_text.contains("#EXTM3U") {
+        return info;
+    }
+
+    let media_text = if master_text.contains("#EXT-X-STREAM-INF:") {
+        struct Variant {
+            height: u32,
+            fps: Option<f64>,
+            bandwidth: u64,
+            uri: String,
+        }
+        let mut variants: Vec<Variant> = Vec::new();
+        let mut pending: Option<(u32, Option<f64>, u64)> = None;
+
+        for raw_line in master_text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+                let height = parse_m3u8_attr(attrs, "RESOLUTION")
+                    .and_then(|r| r.split('x').nth(1))
+                    .and_then(|h| h.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let fps = parse_m3u8_attr(attrs, "FRAME-RATE")
+                    .and_then(|f| f.parse::<f64>().ok())
+                    .filter(|&f| f.is_finite() && f > 0.5 && f <= 240.0);
+                let bandwidth = parse_m3u8_attr(attrs, "BANDWIDTH")
+                    .and_then(|b| b.parse::<u64>().ok())
+                    .unwrap_or(0);
+                pending = Some((height, fps, bandwidth));
+            } else if !line.starts_with('#') {
+                if let Some((height, fps, bandwidth)) = pending.take() {
+                    variants.push(Variant {
+                        height,
+                        fps: fps.or_else(|| infer_fps_from_variant_uri(line)),
+                        bandwidth,
+                        uri: line.to_string(),
+                    });
+                }
+            }
+        }
+
+        let (max_h, max_fps): (Option<u32>, Option<f64>) = match res {
+            Resolution::R1080p60 => (Some(1080), Some(60.5)),
+            Resolution::R1080p => (Some(1080), None),
+            Resolution::R720p60 => (Some(720), Some(60.5)),
+            Resolution::R720p => (Some(720), None),
+            Resolution::R480p => (Some(480), None),
+            Resolution::R360p => (Some(360), None),
+            Resolution::AudioOnly => (None, None),
+        };
+
+        fn pick_best<'a>(items: impl Iterator<Item = &'a Variant>) -> Option<&'a Variant> {
+            items.max_by_key(|v| {
+                (
+                    v.height,
+                    v.fps.map(|f| (f * 100.0) as u64).unwrap_or(0),
+                    v.bandwidth,
+                )
+            })
+        }
+
+        let filtered = variants.iter().filter(|v| {
+            let h_ok = max_h.map(|mh| v.height == 0 || v.height <= mh).unwrap_or(true);
+            let f_ok = match (max_fps, v.fps) {
+                (Some(mf), Some(vf)) => vf <= mf,
+                _ => true,
+            };
+            h_ok && f_ok
+        });
+
+        let chosen = pick_best(filtered).or_else(|| pick_best(variants.iter()));
+        if let Some(variant) = chosen {
+            info.fps = variant.fps;
+            let media_url = resolve_relative_url(m3u8_url, &variant.uri);
+            fetch_text_with_kick_headers(&media_url).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        info.fps = infer_fps_from_variant_uri(m3u8_url);
+        master_text
+    };
+
+    let mut total_dur = 0.0_f64;
+    let mut seg_count = 0u64;
+    for line in media_text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("#EXTINF:") {
+            let num_part = rest.split(',').next().unwrap_or("").trim();
+            if let Ok(sec) = num_part.parse::<f64>() {
+                if sec.is_finite() && sec > 0.0 {
+                    total_dur += sec;
+                    seg_count += 1;
+                }
+            }
+        }
+    }
+
+    if seg_count > 0 && total_dur > 0.0 {
+        info.duration_secs = Some(total_dur);
+    }
+    info
+}
+
+fn probe_with_ffprobe(url: &str) -> StreamProbeInfo {
+    let mut info = StreamProbeInfo::default();
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-user_agent",
+        CHROME_UA,
+        "-headers",
+        "Origin: https://kick.com\r\nReferer: https://kick.com/\r\n",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames,avg_frame_rate,r_frame_rate,duration:format=duration",
+        "-of",
+        "default=noprint_wrappers=1",
+        url,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let Ok(out) = cmd.output() else {
+        return info;
+    };
+    if !out.status.success() {
+        return info;
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut avg_fps: Option<f64> = None;
+    let mut r_fps: Option<f64> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "nb_frames" => {
+                    if let Ok(n) = v.trim().parse::<u64>() {
+                        if n > 0 {
+                            info.total_frames = Some(n);
+                            info.exact_frame_count = true;
+                        }
+                    }
+                }
+                "avg_frame_rate" => {
+                    if avg_fps.is_none() {
+                        avg_fps = parse_rational_fps(v);
+                    }
+                }
+                "r_frame_rate" => {
+                    if r_fps.is_none() {
+                        r_fps = parse_rational_fps(v);
+                    }
+                }
+                "duration" => {
+                    if let Ok(d) = v.trim().parse::<f64>() {
+                        if d.is_finite() && d > 0.0 && info.duration_secs.is_none() {
+                            info.duration_secs = Some(d);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    info.fps = avg_fps.or(r_fps);
+    info
+}
+
+fn probe_stream_for_progress(
+    stream_url: &str,
+    res: Resolution,
+    api_duration_secs: Option<f64>,
+    start_t: &str,
+    end_t: &str,
+    tx: &Sender<WorkerEvent>,
+) -> ProgressTarget {
+    let audio_only = res == Resolution::AudioOnly;
+    let mut probe = if stream_url.to_ascii_lowercase().contains(".m3u8") {
+        probe_hls_stream(stream_url, res)
+    } else {
+        StreamProbeInfo::default()
+    };
+
+    let needs_ffprobe = probe.duration_secs.is_none()
+        || (!audio_only && probe.fps.is_none() && probe.total_frames.is_none());
+    if needs_ffprobe {
+        let fp = probe_with_ffprobe(stream_url);
+        if probe.duration_secs.is_none() {
+            probe.duration_secs = fp.duration_secs;
+        }
+        if probe.fps.is_none() {
+            probe.fps = fp.fps;
+        }
+        if probe.total_frames.is_none() {
+            probe.total_frames = fp.total_frames;
+            probe.exact_frame_count = fp.exact_frame_count;
+        }
+    }
+
+    let start_secs = parse_hms_to_secs(start_t);
+    let end_secs = parse_hms_to_secs(end_t);
+    let is_sliced = start_secs.is_some() || end_secs.is_some();
+
+    let full_duration = probe.duration_secs.or(api_duration_secs);
+    let target_duration_secs = match (start_secs, end_secs, full_duration) {
+        (Some(s), Some(e), _) if e > s => Some(e - s),
+        (None, Some(e), Some(full)) if e > 0.0 => Some(e.min(full)),
+        (None, Some(e), None) if e > 0.0 => Some(e),
+        (Some(s), None, Some(full)) if full > s => Some(full - s),
+        (None, None, Some(full)) if full > 0.0 => Some(full),
+        _ => full_duration.filter(|&d| d > 0.0),
+    };
+
+    let exact_frame_count = !audio_only && !is_sliced && probe.exact_frame_count;
+    let total_frames = if audio_only {
+        None
+    } else if exact_frame_count {
+        probe.total_frames
+    } else {
+        match (target_duration_secs, probe.fps) {
+            (Some(d), Some(fps)) if d > 0.0 && fps > 0.0 => Some((d * fps).round() as u64),
+            _ => None,
+        }
+    };
+
+    let label = if is_sliced {
+        "Slice target"
+    } else {
+        "Stream target"
+    };
+    match (target_duration_secs, total_frames, probe.fps) {
+        (Some(d), Some(tf), Some(fps)) => {
+            let _ = tx.send(WorkerEvent::Log(format!(
+                "[progress] {}: {} ({} frames @ {:.2} fps)",
+                label,
+                format_secs_hms(d),
+                format_with_commas(tf),
+                fps
+            )));
+        }
+        (Some(d), Some(tf), None) => {
+            let _ = tx.send(WorkerEvent::Log(format!(
+                "[progress] {}: {} ({} frames)",
+                label,
+                format_secs_hms(d),
+                format_with_commas(tf)
+            )));
+        }
+        (Some(d), None, _) => {
+            let _ = tx.send(WorkerEvent::Log(format!(
+                "[progress] {}: {}",
+                label,
+                format_secs_hms(d)
+            )));
+        }
+        (None, Some(tf), _) => {
+            let _ = tx.send(WorkerEvent::Log(format!(
+                "[progress] {}: {} frames",
+                label,
+                format_with_commas(tf)
+            )));
+        }
+        (None, None, _) => {}
+    }
+
+    ProgressTarget {
+        duration_secs: target_duration_secs,
+        fps: probe.fps,
+        total_frames,
+        exact_frame_count,
+        start_secs,
+        end_secs,
+        audio_only,
+    }
+}
+
+fn read_cr_lf_lines<R: Read, F: FnMut(String) -> bool>(reader: R, mut on_line: F) {
+    let mut br = BufReader::new(reader);
+    let mut buf = [0u8; 4096];
+    let mut line_bytes: Vec<u8> = Vec::with_capacity(256);
+
+    while let Ok(n) = br.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if b == b'\r' || b == b'\n' {
+                if !line_bytes.is_empty() {
+                    let s = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                    line_bytes.clear();
+                    if !s.is_empty() && !on_line(s) {
+                        return;
+                    }
+                }
+            } else {
+                line_bytes.push(b);
+            }
+        }
+    }
+    if !line_bytes.is_empty() {
+        let s = String::from_utf8_lossy(&line_bytes).trim().to_string();
+        if !s.is_empty() {
+            let _ = on_line(s);
+        }
+    }
+}
+
+fn extract_ffmpeg_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let mut search = line;
+    while let Some(pos) = search.find(key) {
+        let boundary_ok = pos == 0 || search.as_bytes()[pos - 1].is_ascii_whitespace();
+        let after = &search[pos + key.len()..];
+        if boundary_ok {
+            let val = after.trim_start().split_whitespace().next()?;
+            return Some(val);
+        }
+        search = after;
+    }
+    None
+}
+
+fn parse_ffmpeg_header_duration(line: &str) -> Option<f64> {
+    let idx = line.find("Duration:")?;
+    let rest = line[idx + "Duration:".len()..].trim_start();
+    let token = rest.split(&[',', ' '][..]).next()?;
+    parse_hms_to_secs(token)
+}
+
+fn parse_ffmpeg_header_fps(line: &str) -> Option<f64> {
+    if !line.contains("Video:") {
+        return None;
+    }
+    for marker in [" fps", " tbr"] {
+        if let Some(pos) = line.find(marker) {
+            let before = line[..pos].trim_end();
+            let token = before
+                .rsplit(&[',', ' '][..])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if let Ok(fps) = token.parse::<f64>() {
+                if fps.is_finite() && fps > 0.5 && fps <= 240.0 {
+                    return Some(fps);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn compute_ffmpeg_progress(
+    line: &str,
+    target: &ProgressTarget,
+) -> (Option<f32>, String) {
+    let cur_frame = extract_ffmpeg_field(line, "frame=").and_then(|v| v.parse::<u64>().ok());
+    let cur_time = extract_ffmpeg_field(line, "time=").and_then(parse_hms_to_secs);
+    let speed = extract_ffmpeg_field(line, "speed=")
+        .filter(|s| !s.eq_ignore_ascii_case("N/A"));
+
+    let frame_ratio = match (cur_frame, target.total_frames) {
+        (Some(f), Some(tf)) if tf > 0 => Some((f as f64 / tf as f64).clamp(0.0, 0.999)),
+        _ => None,
+    };
+    let time_ratio = match (cur_time, target.duration_secs) {
+        (Some(t), Some(td)) if td > 0.0 => Some((t / td).clamp(0.0, 0.999)),
+        _ => None,
+    };
+
+    let ratio = if target.exact_frame_count {
+        frame_ratio.or(time_ratio)
+    } else {
+        time_ratio
+            .filter(|&r| r > 0.0)
+            .or(frame_ratio)
+            .or(time_ratio)
+    }
+    .map(|r| r as f32);
+
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    match (cur_frame, target.total_frames) {
+        (Some(f), Some(tf)) if tf > 0 => {
+            parts.push(format!(
+                "Frame {} / {}",
+                format_with_commas(f),
+                format_with_commas(tf)
+            ));
+        }
+        (Some(f), None) if f > 0 => {
+            parts.push(format!("Frame {}", format_with_commas(f)));
+        }
+        _ => {}
+    }
+
+    match (cur_time, target.duration_secs) {
+        (Some(t), Some(td)) if td > 0.0 => {
+            parts.push(format!("{} / {}", format_secs_hms(t), format_secs_hms(td)));
+        }
+        (Some(t), None) => {
+            parts.push(format_secs_hms(t));
+        }
+        _ => {}
+    }
+
+    if let Some(sp) = speed {
+        parts.push(sp.to_string());
+    }
+
+    let status_text = if parts.is_empty() {
+        line.to_string()
+    } else {
+        parts.join(" · ")
+    };
+
+    (ratio, status_text)
 }
 
 fn read_clipboard_text() -> Option<String> {
@@ -1373,16 +2021,10 @@ fn draw_brand_mark(ui: &mut egui::Ui, size: f32) {
     let oy = rect.min.y;
     let stroke = Stroke::new((s * 0.105).max(2.0), ACCENT_GREEN);
 
-    let pts = vec![
-        Pos2::new(ox + s * 0.69, oy + s * 0.27),
-        Pos2::new(ox + s * 0.34, oy + s * 0.27),
-        Pos2::new(ox + s * 0.34, oy + s * 0.49),
-        Pos2::new(ox + s * 0.61, oy + s * 0.49),
-        Pos2::new(ox + s * 0.69, oy + s * 0.56),
-        Pos2::new(ox + s * 0.69, oy + s * 0.68),
-        Pos2::new(ox + s * 0.61, oy + s * 0.74),
-        Pos2::new(ox + s * 0.33, oy + s * 0.74),
-    ];
+    let pts: Vec<Pos2> = BRAND_5_PTS
+        .iter()
+        .map(|&(nx, ny)| Pos2::new(ox + s * nx, oy + s * ny))
+        .collect();
     painter.add(Shape::line(pts, stroke));
 }
 
@@ -1474,9 +2116,14 @@ fn draw_nav_icon(ui: &mut egui::Ui, tab: Tab, size: f32, color: Color32) {
 /// Sleek 8px progress bar inside a single-line horizontal layout (never expands vertically).
 fn draw_progress_row(ui: &mut egui::Ui, progress: f32) {
     let clamped = progress.clamp(0.0, 1.0);
-    let pct = (clamped * 100.0).round() as u32;
+    let pct_val = clamped * 100.0;
+    let pct_label = if pct_val >= 99.95 {
+        "100%".to_string()
+    } else {
+        format!("{:>5.1}%", pct_val)
+    };
     ui.horizontal(|ui| {
-        let pct_label_w = 40.0;
+        let pct_label_w = 50.0;
         let track_w = (ui.available_width() - pct_label_w - 10.0).max(40.0);
         let (track_rect, _) = ui.allocate_exact_size(Vec2::new(track_w, 8.0), Sense::hover());
         let painter = ui.painter();
@@ -1492,7 +2139,7 @@ fn draw_progress_row(ui: &mut egui::Ui, progress: f32) {
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                RichText::new(format!("{:>3}%", pct))
+                RichText::new(pct_label)
                     .size(12.0)
                     .family(FontFamily::Monospace)
                     .strong()
@@ -2242,7 +2889,7 @@ impl FiveKdApp {
             saved_file_path: None,
             resolution: res.short_label(),
             format: ext.upper(),
-            progress: 0.02,
+            progress: 0.0,
             status_text: "Extracting Master M3U8 URL from Kick...".to_string(),
             status: DownloadStatus::Active,
             cancel_flag: cancel_flag.clone(),
@@ -2285,6 +2932,18 @@ impl FiveKdApp {
                 }
             };
 
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let progress_target = probe_stream_for_progress(
+                &extracted.m3u8_url,
+                res,
+                extracted.duration_secs,
+                &start_t,
+                &end_t,
+                &tx,
+            );
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
@@ -2360,33 +3019,62 @@ impl FiveKdApp {
                         let tx_err = tx.clone();
                         let cancel_err = cancel_flag.clone();
                         let notifier_err = notifier.clone();
+                        let mut target_err = progress_target;
                         thread::spawn(move || {
-                            let reader = BufReader::new(stderr);
                             let mut last_prog = Instant::now()
                                 .checked_sub(Duration::from_secs(1))
                                 .unwrap_or_else(Instant::now);
-                            for line in reader.lines().flatten() {
+                            let mut last_prog_log = Instant::now()
+                                .checked_sub(Duration::from_secs(1))
+                                .unwrap_or_else(Instant::now);
+
+                            read_cr_lf_lines(stderr, |line| {
                                 if cancel_err.load(Ordering::SeqCst) {
-                                    break;
+                                    return false;
                                 }
-                                if (line.contains("frame=") || line.contains("time="))
-                                    && last_prog.elapsed() >= Duration::from_millis(80)
-                                {
-                                    last_prog = Instant::now();
-                                    let _ =
-                                        tx_err.send(WorkerEvent::Progress(id, 0.5, line.clone()));
+
+                                if target_err.duration_secs.is_none() {
+                                    if let Some(dur) = parse_ffmpeg_header_duration(&line) {
+                                        target_err.update_from_stream_duration(dur);
+                                    }
                                 }
-                                let _ = tx_err.send(WorkerEvent::Log(line));
+                                if target_err.fps.is_none() {
+                                    if let Some(fps) = parse_ffmpeg_header_fps(&line) {
+                                        target_err.update_fps(fps);
+                                    }
+                                }
+
+                                let is_progress_line =
+                                    line.contains("frame=") || line.contains("time=");
+                                if is_progress_line {
+                                    if last_prog.elapsed() >= Duration::from_millis(80) {
+                                        last_prog = Instant::now();
+                                        let (ratio_opt, status_text) =
+                                            compute_ffmpeg_progress(&line, &target_err);
+                                        let prog_val = ratio_opt.unwrap_or(-1.0);
+                                        let _ = tx_err.send(WorkerEvent::Progress(
+                                            id,
+                                            prog_val,
+                                            status_text,
+                                        ));
+                                    }
+                                    if last_prog_log.elapsed() >= Duration::from_millis(500) {
+                                        last_prog_log = Instant::now();
+                                        let _ = tx_err.send(WorkerEvent::Log(line));
+                                    }
+                                } else {
+                                    let _ = tx_err.send(WorkerEvent::Log(line));
+                                }
                                 notifier_err.wake_throttled();
-                            }
+                                true
+                            });
                         });
                     }
 
                     if let Some(stdout) = child.stdout.take() {
-                        let reader = BufReader::new(stdout);
-                        for line in reader.lines().flatten() {
+                        read_cr_lf_lines(stdout, |line| {
                             if cancel_flag.load(Ordering::SeqCst) {
-                                break;
+                                return false;
                             }
                             if let Some(pct_idx) = line.find('%') {
                                 let before = &line[..pct_idx];
@@ -2394,7 +3082,7 @@ impl FiveKdApp {
                                     if let Ok(pct) = num_str.parse::<f32>() {
                                         let _ = tx.send(WorkerEvent::Progress(
                                             id,
-                                            (pct / 100.0).clamp(0.0, 1.0),
+                                            (pct / 100.0).clamp(0.0, 0.999),
                                             line.clone(),
                                         ));
                                     }
@@ -2402,7 +3090,8 @@ impl FiveKdApp {
                             }
                             let _ = tx.send(WorkerEvent::Log(line));
                             notifier.wake_throttled();
-                        }
+                            true
+                        });
                     }
 
                     let status = child.wait();
@@ -2470,7 +3159,7 @@ impl FiveKdApp {
                 }
                 WorkerEvent::Progress(id, prog, status) => {
                     if let Some(item) = self.active_downloads.iter_mut().find(|i| i.id == id) {
-                        if prog > item.progress {
+                        if prog >= 0.0 && prog > item.progress {
                             item.progress = prog;
                         }
                         item.status_text = status;
@@ -3853,34 +4542,91 @@ impl eframe::App for FiveKdApp {
     }
 }
 
+fn sd_rounded_box(px: f32, py: f32, cx: f32, cy: f32, hx: f32, hy: f32, r: f32) -> f32 {
+    let qx = (px - cx).abs() - (hx - r);
+    let qy = (py - cy).abs() - (hy - r);
+    let outside = qx.max(0.0).hypot(qy.max(0.0));
+    let inside = qx.max(qy).min(0.0);
+    outside + inside - r
+}
+
+fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq > 0.0 {
+        (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (px - (ax + t * dx)).hypot(py - (ay + t * dy))
+}
+
 fn load_window_icon() -> Arc<egui::IconData> {
-    let size = 64usize;
-    let mut rgba = vec![0u8; size * size * 4];
-    for y in 0..size {
-        for x in 0..size {
-            let idx = (y * size + x) * 4;
-            let mut is_green = false;
-            if (8..56).contains(&x) && (5..59).contains(&y) {
-                let gx = (x - 8) / 3;
-                let gy = (y - 5) / 3;
-                if gy < 18 && gx < 16 && ICON_5_GRID[gy].as_bytes()[gx] == b'#' {
-                    is_green = true;
+    const SIZE: usize = 128;
+    const SAMPLES: usize = 4;
+    let size_f = SIZE as f32;
+    let border_w = 0.042_f32.max(1.25 / size_f);
+    let half_border = border_w * 0.5;
+    let margin = 0.015_f32;
+    let half_box = 0.5 - margin - half_border;
+    let corner_r = (0.21875 - half_border).max(0.02);
+    let half_five = (0.105_f32 * 0.5).max(0.85 / size_f);
+
+    let mut rgba = vec![0u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let mut sum_r = 0.0_f32;
+            let mut sum_g = 0.0_f32;
+            let mut sum_b = 0.0_f32;
+            let mut sum_a = 0.0_f32;
+
+            for sy in 0..SAMPLES {
+                let v = (y as f32 + (sy as f32 + 0.5) / SAMPLES as f32) / size_f;
+                for sx in 0..SAMPLES {
+                    let u = (x as f32 + (sx as f32 + 0.5) / SAMPLES as f32) / size_f;
+                    let d_box = sd_rounded_box(u, v, 0.5, 0.5, half_box, half_box, corner_r);
+                    if d_box > half_border {
+                        continue;
+                    }
+
+                    let mut d_five = f32::MAX;
+                    for pair in BRAND_5_PTS.windows(2) {
+                        let d = dist_to_segment(u, v, pair[0].0, pair[0].1, pair[1].0, pair[1].1);
+                        if d < d_five {
+                            d_five = d;
+                        }
+                    }
+
+                    let (sr, sg, sb) = if d_box >= -half_border || d_five <= half_five {
+                        (0.0_f32, 231.0_f32, 1.0_f32) // #00E701
+                    } else {
+                        (13.0_f32, 14.0_f32, 16.0_f32) // #0D0E10
+                    };
+
+                    sum_r += sr;
+                    sum_g += sg;
+                    sum_b += sb;
+                    sum_a += 1.0;
                 }
             }
-            if is_green {
-                rgba[idx] = 0;
-                rgba[idx + 1] = 231;
-                rgba[idx + 2] = 1;
-                rgba[idx + 3] = 255;
-            } else {
-                rgba[idx + 3] = 255;
+
+            if sum_a > 0.0 {
+                let idx = (y * SIZE + x) * 4;
+                rgba[idx] = (sum_r / sum_a).round().clamp(0.0, 255.0) as u8;
+                rgba[idx + 1] = (sum_g / sum_a).round().clamp(0.0, 255.0) as u8;
+                rgba[idx + 2] = (sum_b / sum_a).round().clamp(0.0, 255.0) as u8;
+                rgba[idx + 3] = ((sum_a / (SAMPLES * SAMPLES) as f32) * 255.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
             }
         }
     }
+
     Arc::new(egui::IconData {
         rgba,
-        width: size as u32,
-        height: size as u32,
+        width: SIZE as u32,
+        height: SIZE as u32,
     })
 }
 

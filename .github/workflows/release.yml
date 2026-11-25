@@ -161,12 +161,6 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Generate SHA256 checksums
-        working-directory: release-assets
-        run: |
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
       - name: Resolve Release Tag
         id: resolve_tag
         run: |
@@ -181,7 +175,7 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Remove legacy portable .exe assets from release page
+      - name: Remove legacy assets from release page
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -196,6 +190,7 @@ jobs:
             "5KD-linux-x86_64"
             "5KD-macos-arm64"
             "5KD-macos-x86_64"
+            "SHA256SUMS.txt"
           )
           for asset in "${LEGACY_ASSETS[@]}"; do
             gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes 2>/dev/null || true
@@ -219,15 +214,17 @@ jobs:
             | **macOS** | Intel (x86_64) | `5KD-macos-x86_64.tar.gz` |
 
             ### Highlights
+            - **Precise Frame- & Duration-Based Download Progress**: Probes HLS M3U8 `#EXTINF` segment durations & `FRAME-RATE` (and `ffprobe` `nb_frames`/FPS/duration for MP4 clips) before downloading, adjusts targets automatically for Start/End time slicing (`-ss` / `-to`), reads live `\r`/`\n` `ffmpeg` updates in real time, and shows 1-decimal percentage progress (`0.0%`–`99.9%` → `100%`) alongside `Frame X / Y · HH:MM:SS / HH:MM:SS · speed`.
+            - **Unified Geometric App Icon**: Upgraded the Windows `.exe` & setup wizard installer icon (`16×16`–`256×256` multi-size anti-aliased `.ico` with transparent rounded corners) and the runtime window/taskbar icon (`128×128`) to match the in-app `#00E701` geometric "5" brand mark.
             - **In-App Auto-Updater**: Check for new GitHub releases directly inside the **About** tab or automatically on launch—downloads the matching platform installer directly inside the app with zero browser tabs, installs silently, cleans up temporary installer files, and restarts automatically.
-            - **Fast Windows Setup Wizard Installer**: Native LZMA2-compressed installer with Start Menu shortcut, optional Desktop shortcut, embedded `#00E701` icon, and uninstaller support.
+            - **Fast Windows Setup Wizard Installer**: Native LZMA2-compressed installer with Start Menu shortcut, optional Desktop shortcut, embedded `#00E701` geometric icon, and uninstaller support.
             - **VOD & Clip Title File Naming**: Automatically names downloaded files after the actual Kick VOD or Clip title.
             - **Persistent Output Folder**: Automatically remembers your chosen output folder, quality, container format, and zoom level across restarts.
             - **Integrated Kick VOD & Clip Extractor**: Resolves `v1/video/{uuid}`, UUIDv7 `v2/channels/{user}/videos`, `v2/clips/{clip_id}`, and CDN prefixes (`prefixes.json`) with silent background fallbacks.
             - **Multi-Threaded HLS Engine**: Powered by `yt-dlp` (`-N 8`) and `ffmpeg` with lossless time slicing (`-ss` / `-to`).
 
             ### Requirements
-            - `yt-dlp` and `ffmpeg` installed and available in your system `PATH`:
+            - `yt-dlp` and `ffmpeg` (including `ffprobe`) installed and available in your system `PATH`:
               - **Windows**: `winget install yt-dlp.yt-dlp Gyan.FFmpeg`
               - **macOS**: `brew install yt-dlp ffmpeg`
               - **Linux**: `sudo apt install yt-dlp ffmpeg`
