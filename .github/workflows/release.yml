@@ -207,27 +207,15 @@ jobs:
             ### Installers & Packages
             | Platform | Architecture | Package |
             | :--- | :--- | :--- |
-            | **Windows** | x86_64 (64-bit) | `5KD-windows-x86_64-setup.exe` *(Windows Setup Wizard Installer)* |
-            | **Windows** | ARM64 | `5KD-windows-arm64-setup.exe` *(Windows Setup Wizard Installer)* |
+            | **Windows** | x86_64 (64-bit) | `5KD-windows-x86_64-setup.exe` |
+            | **Windows** | ARM64 | `5KD-windows-arm64-setup.exe` |
             | **Linux** | x86_64 (64-bit) | `5KD-linux-x86_64.tar.gz` |
             | **macOS** | Apple Silicon (M1–M4) | `5KD-macos-arm64.tar.gz` |
             | **macOS** | Intel (x86_64) | `5KD-macos-x86_64.tar.gz` |
 
-            ### Highlights
-            - **Precise Frame- & Duration-Based Download Progress**: Probes HLS M3U8 `#EXTINF` segment durations & `FRAME-RATE` (and `ffprobe` `nb_frames`/FPS/duration for MP4 clips) before downloading, adjusts targets automatically for Start/End time slicing (`-ss` / `-to`), reads live `\r`/`\n` `ffmpeg` updates in real time, and shows 1-decimal percentage progress (`0.0%`–`99.9%` → `100%`) alongside `Frame X / Y · HH:MM:SS / HH:MM:SS · speed`.
-            - **Unified Geometric App Icon**: Upgraded the Windows `.exe` & setup wizard installer icon (`16×16`–`256×256` multi-size anti-aliased `.ico` with transparent rounded corners) and the runtime window/taskbar icon (`128×128`) to match the in-app `#00E701` geometric "5" brand mark.
-            - **In-App Auto-Updater**: Check for new GitHub releases directly inside the **About** tab or automatically on launch—downloads the matching platform installer directly inside the app with zero browser tabs, installs silently, cleans up temporary installer files, and restarts automatically.
-            - **Fast Windows Setup Wizard Installer**: Native LZMA2-compressed installer with Start Menu shortcut, optional Desktop shortcut, embedded `#00E701` geometric icon, and uninstaller support.
-            - **VOD & Clip Title File Naming**: Automatically names downloaded files after the actual Kick VOD or Clip title.
-            - **Persistent Output Folder**: Automatically remembers your chosen output folder, quality, container format, and zoom level across restarts.
-            - **Integrated Kick VOD & Clip Extractor**: Resolves `v1/video/{uuid}`, UUIDv7 `v2/channels/{user}/videos`, `v2/clips/{clip_id}`, and CDN prefixes (`prefixes.json`) with silent background fallbacks.
-            - **Multi-Threaded HLS Engine**: Powered by `yt-dlp` (`-N 8`) and `ffmpeg` with lossless time slicing (`-ss` / `-to`).
-
-            ### Requirements
-            - `yt-dlp` and `ffmpeg` (including `ffprobe`) installed and available in your system `PATH`:
-              - **Windows**: `winget install yt-dlp.yt-dlp Gyan.FFmpeg`
-              - **macOS**: `brew install yt-dlp ffmpeg`
-              - **Linux**: `sudo apt install yt-dlp ffmpeg`
+            ## What's Changed
+            - fix(updater): replace Windows batch updater with a native headless update helper to prevent hanging `cmd`/`findstr` windows on Update & Restart
+            - feat(ui): add VOD Metadata Panel with thumbnail preview, stream info, available qualities, live size estimate, and prefetched metadata reuse
           files: |
             release-assets/*
           draft: false

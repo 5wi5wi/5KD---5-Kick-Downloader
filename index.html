@@ -543,6 +543,191 @@
         box-shadow: none;
       }
 
+      /* VOD Metadata Panel (Zero-Pill, Single-Elevation) */
+      .vod-meta-panel {
+        display: none;
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: 10px;
+        padding: 12px 14px;
+      }
+
+      .vod-meta-panel.visible {
+        display: block;
+      }
+
+      .vod-meta-status-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .vod-meta-status-left {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+        flex: 1;
+        font-size: 12px;
+      }
+
+      .vod-meta-status-label {
+        font-weight: 600;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+
+      .vod-meta-status-detail {
+        color: var(--text-muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .vod-meta-body {
+        display: flex;
+        align-items: stretch;
+        gap: 14px;
+      }
+
+      .vod-thumb-wrap {
+        position: relative;
+        width: 160px;
+        height: 90px;
+        border-radius: 6px;
+        overflow: hidden;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-subtle);
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .vod-thumb-img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+
+      .vod-thumb-fallback {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        color: var(--text-muted);
+      }
+
+      .vod-thumb-dur {
+        position: absolute;
+        right: 5px;
+        bottom: 5px;
+        background: rgba(0, 0, 0, 0.84);
+        color: var(--text-primary);
+        font-size: 10.5px;
+        font-weight: 600;
+        padding: 2px 5px;
+        border-radius: 4px;
+        line-height: 1.2;
+      }
+
+      .vod-meta-info {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        gap: 4px;
+      }
+
+      .vod-meta-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .vod-meta-title {
+        font-size: 14px;
+        font-weight: 700;
+        color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
+      }
+
+      .vod-meta-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+
+      .btn-mini {
+        background: var(--bg-elevated);
+        color: var(--text-muted);
+        border: 1px solid var(--border-hover);
+        font-family: inherit;
+        font-weight: 600;
+        font-size: 11px;
+        padding: 0 8px;
+        height: 24px;
+        border-radius: 6px;
+        cursor: pointer;
+        white-space: nowrap;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: border-color 0.14s ease, color 0.14s ease;
+      }
+
+      .btn-mini:hover {
+        border-color: var(--accent-green);
+        color: var(--accent-green);
+      }
+
+      .vod-meta-line {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text-muted);
+        min-width: 0;
+      }
+
+      .vod-meta-channel {
+        color: var(--accent-green);
+        font-weight: 600;
+      }
+
+      .vod-meta-kind {
+        color: var(--text-primary);
+      }
+
+      .vod-meta-stream {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11.5px;
+        color: var(--text-muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .vod-meta-save {
+        font-size: 11px;
+        color: var(--text-muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
       /* Section Headers & Cards */
       .section-header {
         display: flex;
@@ -1022,7 +1207,7 @@
         <!-- Downloads View -->
         <div id="tab-downloads" class="tab-view active">
           <form class="surface-bar url-bar" onsubmit="startDownload(event)">
-            <input id="url-input" class="url-input" type="text" oninput="updateDownloadButtonState()" placeholder="Paste Kick VOD or clip URL here..." autocomplete="off" />
+            <input id="url-input" class="url-input" type="text" oninput="handleUrlInput()" placeholder="Paste Kick VOD or clip URL here..." autocomplete="off" />
             <button type="button" class="btn-secondary" onclick="pasteFromClipboard()" title="Paste URL from clipboard" style="height:34px;">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <rect x="9" y="3" width="6" height="4" rx="1" />
@@ -1033,14 +1218,16 @@
             <button type="submit" class="btn-primary" id="dl-btn" disabled title="Choose an output folder below before downloading">Download</button>
           </form>
 
+          <div id="vod-meta-panel" class="vod-meta-panel" aria-live="polite"></div>
+
           <div class="surface-bar options-bar">
             <div class="ctrl-group">
               <label for="start-time">Start</label>
-              <input id="start-time" class="ctrl-input mono" type="text" placeholder="00:00:00" />
+              <input id="start-time" class="ctrl-input mono" type="text" placeholder="00:00:00" oninput="renderVodPreviewPanel()" />
             </div>
             <div class="ctrl-group">
               <label for="end-time">End</label>
-              <input id="end-time" class="ctrl-input mono" type="text" placeholder="HH:MM:SS" />
+              <input id="end-time" class="ctrl-input mono" type="text" placeholder="HH:MM:SS" oninput="renderVodPreviewPanel()" />
             </div>
             <div class="ctrl-group">
               <span>Quality</span>
@@ -1231,10 +1418,17 @@
       let updateBannerDismissed = false;
       let updateTimer = null;
 
+      let vodPreviewState = { status: 'idle' };
+      let vodPreviewReqId = 0;
+      let vodPreviewDebounce = null;
+
       const els = {
         workspace: document.getElementById('workspace'),
         toast: document.getElementById('inline-toast'),
         urlInput: document.getElementById('url-input'),
+        startTime: document.getElementById('start-time'),
+        endTime: document.getElementById('end-time'),
+        vodMetaPanel: document.getElementById('vod-meta-panel'),
         outputPath: document.getElementById('output-path'),
         chooseFolderBtn: document.getElementById('choose-folder-btn'),
         dlBtn: document.getElementById('dl-btn'),
@@ -1332,6 +1526,7 @@
         document.querySelectorAll('.seg-btn').forEach((b) => b.classList.remove('active'));
         if (btn) btn.classList.add('active');
         safeSetStorage(STORAGE_KEYS.FORMAT_EXT, ext);
+        renderVodPreviewPanel();
       }
 
       function toggleResMenu(e) {
@@ -1349,6 +1544,7 @@
         els.resTrigger.classList.remove('open');
         safeSetStorage(STORAGE_KEYS.RES_VALUE, val);
         safeSetStorage(STORAGE_KEYS.RES_LABEL, label);
+        renderVodPreviewPanel();
       }
 
       document.addEventListener('click', (e) => {
@@ -1368,6 +1564,38 @@
         syncUpdateBanner();
       }
 
+      function looksLikeSupportedPreviewUrl(raw) {
+        const trimmed = String(raw || '').trim();
+        if (trimmed.length < 12) return false;
+        const lower = trimmed.toLowerCase();
+        const isKick =
+          lower.includes('kick.com/') &&
+          (lower.includes('/videos/') ||
+            lower.includes('/video/') ||
+            lower.includes('/clips/') ||
+            lower.includes('/clip/') ||
+            lower.includes('clip='));
+        const isM3u8 = (lower.startsWith('http://') || lower.startsWith('https://')) && lower.includes('.m3u8');
+        return isKick || isM3u8;
+      }
+
+      function handleUrlInput() {
+        updateDownloadButtonState();
+        const trimmed = els.urlInput.value.trim();
+        if (vodPreviewDebounce) {
+          clearTimeout(vodPreviewDebounce);
+          vodPreviewDebounce = null;
+        }
+        if (!trimmed || !looksLikeSupportedPreviewUrl(trimmed)) {
+          dismissVodPreview();
+          return;
+        }
+        vodPreviewDebounce = setTimeout(() => {
+          vodPreviewDebounce = null;
+          triggerVodPreview(trimmed);
+        }, 420);
+      }
+
       async function pasteFromClipboard() {
         try {
           const text = await navigator.clipboard.readText();
@@ -1376,6 +1604,11 @@
             els.urlInput.value = trimmed;
             els.urlInput.focus();
             updateDownloadButtonState();
+            if (looksLikeSupportedPreviewUrl(trimmed)) {
+              triggerVodPreview(trimmed);
+            } else {
+              dismissVodPreview();
+            }
           } else {
             showToast('Clipboard is empty');
           }
@@ -1637,6 +1870,118 @@
         return (cleaned || fallback || 'Kick_VOD').slice(0, 150);
       }
 
+      function formatKickDate(raw) {
+        const s = String(raw || '').trim();
+        if (/^\d{8}$/.test(s)) return s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8);
+        const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+        return m ? m[1] : null;
+      }
+
+      function formatSecsHms(secs) {
+        const total = Math.max(0, Math.round(secs || 0));
+        const h = String(Math.floor(total / 3600)).padStart(2, '0');
+        const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+        const s = String(total % 60).padStart(2, '0');
+        return `${h}:${m}:${s}`;
+      }
+
+      function parseHmsToSecs(raw) {
+        const s = String(raw || '').trim();
+        if (!s || s.startsWith('-')) return null;
+        const parts = s.split(':').map((p) => Number(p));
+        if (parts.some((n) => !Number.isFinite(n) || n < 0)) return null;
+        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        if (parts.length === 2) return parts[0] * 60 + parts[1];
+        if (parts.length === 1) return parts[0];
+        return null;
+      }
+
+      function extractThumbUrl(obj) {
+        if (!obj) return null;
+        if (typeof obj.thumbnail_url === 'string' && obj.thumbnail_url.trim()) return obj.thumbnail_url.trim();
+        const t = obj.thumbnail;
+        if (typeof t === 'string' && t.trim()) return t.trim();
+        if (t && typeof t === 'object') {
+          if (typeof t.src === 'string' && t.src.trim()) return t.src.trim();
+          if (typeof t.url === 'string' && t.url.trim()) return t.url.trim();
+        }
+        return null;
+      }
+
+      function extractCategoryName(obj) {
+        if (!obj) return null;
+        if (Array.isArray(obj.categories) && obj.categories[0]?.name) return String(obj.categories[0].name).trim();
+        if (obj.category?.name) return String(obj.category.name).trim();
+        if (typeof obj.category === 'string' && obj.category.trim()) return obj.category.trim();
+        return null;
+      }
+
+      function extractViewsCount(obj) {
+        if (!obj) return null;
+        for (const k of ['views', 'view_count', 'viewer_count']) {
+          const n = Number(obj[k]);
+          if (Number.isFinite(n) && n > 0) return Math.round(n);
+        }
+        return null;
+      }
+
+      async function probeHlsVariantsWeb(m3u8Url) {
+        if (!m3u8Url || !m3u8Url.toLowerCase().includes('.m3u8')) return [];
+        const encoded = encodeURIComponent(m3u8Url);
+        for (const u of [VIDDASTRAGE_PROXY + encoded, m3u8Url]) {
+          try {
+            const r = await fetch(u);
+            if (!r.ok) continue;
+            const txt = await r.text();
+            if (!txt.includes('#EXT-X-STREAM-INF:')) continue;
+            const variants = [];
+            let pending = null;
+            for (const rawLine of txt.split(/\r?\n/)) {
+              const line = rawLine.trim();
+              if (!line) continue;
+              if (line.startsWith('#EXT-X-STREAM-INF:')) {
+                const resM = line.match(/RESOLUTION=\d+x(\d+)/i);
+                const fpsM = line.match(/FRAME-RATE=([\d.]+)/i);
+                const bwM = line.match(/BANDWIDTH=(\d+)/i);
+                pending = {
+                  height: resM ? parseInt(resM[1], 10) : 0,
+                  fps: fpsM ? parseFloat(fpsM[1]) : null,
+                  bandwidthBps: bwM ? parseInt(bwM[1], 10) : 0
+                };
+              } else if (!line.startsWith('#') && pending) {
+                const lower = line.toLowerCase();
+                let fps = pending.fps;
+                if (!fps) {
+                  if (lower.includes('p60') || lower.includes('60fps')) fps = 60;
+                  else if (lower.includes('p50')) fps = 50;
+                  else if (lower.includes('p30')) fps = 30;
+                }
+                const label =
+                  pending.height > 0
+                    ? fps && fps >= 48
+                      ? `${pending.height}p${Math.round(fps)}`
+                      : `${pending.height}p`
+                    : pending.bandwidthBps > 0
+                      ? 'Source'
+                      : null;
+                if (label) {
+                  const existing = variants.find((v) => v.label === label);
+                  if (existing) {
+                    existing.bandwidthBps = Math.max(existing.bandwidthBps, pending.bandwidthBps);
+                  } else {
+                    variants.push({ label, height: pending.height, fps, bandwidthBps: pending.bandwidthBps });
+                  }
+                }
+                pending = null;
+              }
+            }
+            variants.sort((a, b) => b.height - a.height || (b.fps || 0) - (a.fps || 0) || b.bandwidthBps - a.bandwidthBps);
+            return variants;
+          } catch (_) {}
+        }
+        return [];
+      }
+
       async function extractKickVodReal(rawUrl) {
         const clipMatch =
           rawUrl.match(/kick\.com\/(?:[^\/]+\/)?clips?\/([a-zA-Z0-9_-]+)/i) ||
@@ -1648,11 +1993,42 @@
           const clipObj = clipRes?.clip || clipRes;
           const clipTitle = (clipObj?.title || clipId).trim();
           const clipSrc = clipObj?.clip_url || clipObj?.video_url || clipObj?.source || rawUrl;
-          return { m3u8: clipSrc, title: clipTitle, sourceType: 'Kick Clip API' };
+          const durSecs = Number(clipObj?.duration) > 0 ? Number(clipObj.duration) : null;
+          return {
+            m3u8: clipSrc,
+            title: clipTitle,
+            channel: clipObj?.channel?.username || clipObj?.channel?.slug || 'kick_clip',
+            durationSecs: durSecs,
+            durationFormatted: durSecs ? formatSecsHms(durSecs) : 'Clip',
+            thumbnailUrl: extractThumbUrl(clipObj),
+            publishedAt: formatKickDate(clipObj?.created_at || clipObj?.started_at),
+            category: extractCategoryName(clipObj),
+            views: extractViewsCount(clipObj),
+            isClip: true,
+            sourceType: 'Kick Clip API',
+            variants: []
+          };
+        }
+
+        if (rawUrl.toLowerCase().includes('.m3u8')) {
+          return {
+            m3u8: rawUrl,
+            title: 'Kick_HLS_Stream',
+            channel: 'kick_stream',
+            durationSecs: null,
+            durationFormatted: 'Live/VOD',
+            thumbnailUrl: null,
+            publishedAt: null,
+            category: null,
+            views: null,
+            isClip: false,
+            sourceType: 'Direct M3U8 URL',
+            variants: []
+          };
         }
 
         const m = rawUrl.match(/kick\.com\/([^\/]+)\/videos\/([a-f0-9-]+)/i);
-        if (!m) return { m3u8: rawUrl, title: 'Kick_HLS_Stream', sourceType: 'Direct URL' };
+        if (!m) throw new Error('Invalid Kick VOD/Clip URL');
         const user = m[1];
         const uuid = m[2];
         let vod = null;
@@ -1696,11 +2072,318 @@
           v2Match?.title ||
           `${user}_${uuid}`
         ).trim();
-        const src = activeVod.source || v2Match?.source;
-        if (src) {
-          return { m3u8: src, title, sourceType: 'Source URL from API' };
+        const rawDur = Number(ls?.duration || activeVod.duration || 0);
+        const totalSecs = rawDur > 100000 ? rawDur / 1000 : rawDur;
+        const durationSecs = totalSecs > 0 ? totalSecs : null;
+        const src = activeVod.source || v2Match?.source || rawUrl;
+        return {
+          m3u8: src,
+          title,
+          channel: ls?.channel?.slug || activeVod.channel?.slug || user,
+          durationSecs,
+          durationFormatted: durationSecs ? formatSecsHms(durationSecs) : 'Full VOD',
+          thumbnailUrl: extractThumbUrl(ls) || extractThumbUrl(activeVod) || extractThumbUrl(v2Match),
+          publishedAt: formatKickDate(ls?.start_time || ls?.created_at || activeVod.start_time || activeVod.created_at),
+          category: extractCategoryName(ls) || extractCategoryName(activeVod) || extractCategoryName(v2Match),
+          views: extractViewsCount(activeVod) || extractViewsCount(ls) || extractViewsCount(v2Match),
+          isClip: false,
+          sourceType: activeVod.source || v2Match?.source ? 'Source URL from API' : 'Kick API',
+          variants: []
+        };
+      }
+
+      function dismissVodPreview() {
+        vodPreviewReqId += 1;
+        if (vodPreviewDebounce) {
+          clearTimeout(vodPreviewDebounce);
+          vodPreviewDebounce = null;
         }
-        throw new Error('No direct source found');
+        vodPreviewState = { status: 'idle' };
+        renderVodPreviewPanel();
+      }
+
+      async function triggerVodPreview(rawUrl) {
+        const trimmed = String(rawUrl || '').trim();
+        if (!looksLikeSupportedPreviewUrl(trimmed)) {
+          dismissVodPreview();
+          return;
+        }
+        vodPreviewReqId += 1;
+        const reqId = vodPreviewReqId;
+        vodPreviewState = { status: 'loading', url: trimmed };
+        renderVodPreviewPanel();
+
+        try {
+          const meta = await extractKickVodReal(trimmed);
+          if (reqId !== vodPreviewReqId) return;
+          if (meta.m3u8 && meta.m3u8.toLowerCase().includes('.m3u8')) {
+            const variants = await probeHlsVariantsWeb(meta.m3u8);
+            if (reqId !== vodPreviewReqId) return;
+            meta.variants = variants;
+          }
+          vodPreviewState = { status: 'ready', sourceUrl: trimmed, meta };
+          renderVodPreviewPanel();
+        } catch (err) {
+          if (reqId !== vodPreviewReqId) return;
+          vodPreviewState = { status: 'error', url: trimmed, message: err.message || 'Could not load metadata' };
+          renderVodPreviewPanel();
+        }
+      }
+
+      function estimatePreviewSizeBytes(meta) {
+        const startS = parseHmsToSecs(els.startTime.value);
+        const endS = parseHmsToSecs(els.endTime.value);
+        const full = meta.durationSecs;
+        let dur = full;
+        if (startS !== null && endS !== null && endS > startS) dur = endS - startS;
+        else if (startS === null && endS !== null && endS > 0) dur = full ? Math.min(endS, full) : endS;
+        else if (startS !== null && endS === null && full && full > startS) dur = full - startS;
+        if (!dur || dur <= 0) return null;
+
+        const resVal = els.resTrigger.value || '1080p60';
+        let bps = 0;
+        if (resVal === 'Audio') {
+          bps = 128000;
+        } else if (Array.isArray(meta.variants) && meta.variants.length) {
+          const limits = {
+            '1080p60': [1080, 60.5],
+            '1080p': [1080, null],
+            '720p60': [720, 60.5],
+            '720p': [720, null],
+            '480p': [480, null],
+            '360p': [360, null]
+          }[resVal] || [1080, 60.5];
+          const match =
+            meta.variants.find(
+              (v) => (v.height === 0 || v.height <= limits[0]) && (!limits[1] || !v.fps || v.fps <= limits[1])
+            ) || meta.variants[0];
+          bps = match?.bandwidthBps || 0;
+        }
+        if (!bps) return null;
+        return Math.round((bps / 8) * dur);
+      }
+
+      function buildFallbackThumbSvg() {
+        const wrap = document.createElement('div');
+        wrap.className = 'vod-thumb-fallback';
+        wrap.setAttribute('aria-hidden', 'true');
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('width', '22');
+        svg.setAttribute('height', '22');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'currentColor');
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', 'M8 5.5v13l11-6.5-11-6.5z');
+        svg.appendChild(path);
+        wrap.appendChild(svg);
+        return wrap;
+      }
+
+      function renderVodPreviewPanel() {
+        const panel = els.vodMetaPanel;
+        if (!panel) return;
+        panel.textContent = '';
+
+        if (vodPreviewState.status === 'idle') {
+          panel.classList.remove('visible');
+          return;
+        }
+
+        panel.classList.add('visible');
+
+        if (vodPreviewState.status === 'loading') {
+          const row = document.createElement('div');
+          row.className = 'vod-meta-status-row';
+
+          const left = document.createElement('div');
+          left.className = 'vod-meta-status-left';
+          const lbl = document.createElement('span');
+          lbl.className = 'vod-meta-status-label';
+          lbl.style.color = 'var(--accent-green)';
+          lbl.textContent = 'Fetching VOD metadata...';
+          const sep = document.createElement('span');
+          sep.style.color = 'var(--text-muted)';
+          sep.textContent = '·';
+          const detail = document.createElement('span');
+          detail.className = 'vod-meta-status-detail mono';
+          detail.textContent = vodPreviewState.url;
+          left.append(lbl, sep, detail);
+
+          const cancelBtn = document.createElement('button');
+          cancelBtn.type = 'button';
+          cancelBtn.className = 'btn-mini';
+          cancelBtn.textContent = 'Cancel';
+          cancelBtn.addEventListener('click', dismissVodPreview);
+
+          row.append(left, cancelBtn);
+          panel.appendChild(row);
+          return;
+        }
+
+        if (vodPreviewState.status === 'error') {
+          const row = document.createElement('div');
+          row.className = 'vod-meta-status-row';
+
+          const left = document.createElement('div');
+          left.className = 'vod-meta-status-left';
+          const lbl = document.createElement('span');
+          lbl.className = 'vod-meta-status-label';
+          lbl.style.color = 'var(--status-canceled)';
+          lbl.textContent = 'Preview unavailable';
+          const sep = document.createElement('span');
+          sep.style.color = 'var(--text-muted)';
+          sep.textContent = '·';
+          const detail = document.createElement('span');
+          detail.className = 'vod-meta-status-detail mono';
+          detail.textContent = vodPreviewState.message;
+          left.append(lbl, sep, detail);
+
+          const actions = document.createElement('div');
+          actions.className = 'vod-meta-actions';
+          const retryBtn = document.createElement('button');
+          retryBtn.type = 'button';
+          retryBtn.className = 'btn-mini';
+          retryBtn.style.color = 'var(--text-primary)';
+          retryBtn.textContent = 'Retry';
+          const retryUrl = vodPreviewState.url;
+          retryBtn.addEventListener('click', () => triggerVodPreview(retryUrl));
+
+          const closeBtn = document.createElement('button');
+          closeBtn.type = 'button';
+          closeBtn.className = 'btn-mini';
+          closeBtn.textContent = '×';
+          closeBtn.title = 'Dismiss';
+          closeBtn.addEventListener('click', dismissVodPreview);
+
+          actions.append(retryBtn, closeBtn);
+          row.append(left, actions);
+          panel.appendChild(row);
+          return;
+        }
+
+        const meta = vodPreviewState.meta;
+        const body = document.createElement('div');
+        body.className = 'vod-meta-body';
+
+        const thumbWrap = document.createElement('div');
+        thumbWrap.className = 'vod-thumb-wrap';
+        if (meta.thumbnailUrl) {
+          const img = document.createElement('img');
+          img.className = 'vod-thumb-img';
+          img.src = meta.thumbnailUrl;
+          img.alt = meta.title + ' thumbnail';
+          img.referrerPolicy = 'no-referrer';
+          img.addEventListener('error', () => {
+            img.remove();
+            thumbWrap.prepend(buildFallbackThumbSvg());
+          });
+          thumbWrap.appendChild(img);
+        } else {
+          thumbWrap.appendChild(buildFallbackThumbSvg());
+        }
+
+        if (meta.durationSecs) {
+          const durStamp = document.createElement('span');
+          durStamp.className = 'vod-thumb-dur mono';
+          durStamp.textContent = meta.durationFormatted;
+          thumbWrap.appendChild(durStamp);
+        }
+
+        const info = document.createElement('div');
+        info.className = 'vod-meta-info';
+
+        const top = document.createElement('div');
+        top.className = 'vod-meta-top';
+        const titleEl = document.createElement('div');
+        titleEl.className = 'vod-meta-title';
+        titleEl.textContent = meta.title;
+        titleEl.title = meta.title;
+
+        const actions = document.createElement('div');
+        actions.className = 'vod-meta-actions';
+        const refreshBtn = document.createElement('button');
+        refreshBtn.type = 'button';
+        refreshBtn.className = 'btn-mini';
+        refreshBtn.textContent = 'Refresh';
+        refreshBtn.title = 'Re-fetch VOD metadata';
+        const refreshUrl = vodPreviewState.sourceUrl;
+        refreshBtn.addEventListener('click', () => triggerVodPreview(refreshUrl));
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'btn-mini';
+        closeBtn.textContent = '×';
+        closeBtn.title = 'Hide metadata panel';
+        closeBtn.addEventListener('click', dismissVodPreview);
+
+        actions.append(refreshBtn, closeBtn);
+        top.append(titleEl, actions);
+
+        const metaLine = document.createElement('div');
+        metaLine.className = 'vod-meta-line';
+        const ch = document.createElement('span');
+        ch.className = 'vod-meta-channel';
+        ch.textContent = meta.channel || 'kick';
+        metaLine.appendChild(ch);
+
+        const addMetaPart = (text, cls) => {
+          const dot = document.createElement('span');
+          dot.textContent = '·';
+          const sp = document.createElement('span');
+          if (cls) sp.className = cls;
+          sp.textContent = text;
+          metaLine.append(dot, sp);
+        };
+        addMetaPart(meta.isClip ? 'Clip' : meta.sourceType === 'Direct M3U8 URL' ? 'HLS' : 'VOD', 'vod-meta-kind');
+        if (meta.category) addMetaPart(meta.category, '');
+        if (meta.publishedAt) addMetaPart(meta.publishedAt, 'mono');
+        if (meta.views) addMetaPart(meta.views.toLocaleString() + ' views', 'mono');
+
+        const streamLine = document.createElement('div');
+        streamLine.className = 'vod-meta-stream mono';
+        const startS = parseHmsToSecs(els.startTime.value);
+        const endS = parseHmsToSecs(els.endTime.value);
+        const isSliced = startS !== null || endS !== null;
+        let sliceDur = null;
+        if (startS !== null && endS !== null && endS > startS) sliceDur = endS - startS;
+        else if (startS === null && endS !== null && endS > 0) sliceDur = meta.durationSecs ? Math.min(endS, meta.durationSecs) : endS;
+        else if (startS !== null && endS === null && meta.durationSecs && meta.durationSecs > startS) sliceDur = meta.durationSecs - startS;
+
+        const durLead = document.createElement('span');
+        if (isSliced && sliceDur) {
+          durLead.style.color = 'var(--accent-green)';
+          durLead.style.fontWeight = '600';
+          durLead.textContent = 'Slice ' + formatSecsHms(sliceDur);
+        } else {
+          durLead.style.color = 'var(--text-primary)';
+          durLead.textContent = meta.durationFormatted || 'Full VOD';
+        }
+        streamLine.appendChild(durLead);
+
+        const tailParts = [];
+        if (Array.isArray(meta.variants) && meta.variants.length) {
+          tailParts.push(meta.variants.slice(0, 5).map((v) => v.label).join(' / '));
+        } else {
+          tailParts.push(meta.sourceType);
+        }
+        const estBytes = estimatePreviewSizeBytes(meta);
+        if (estBytes) tailParts.push('Est. ~' + formatBytes(estBytes));
+        if (tailParts.length) {
+          const sep = document.createElement('span');
+          sep.textContent = '·';
+          const tail = document.createElement('span');
+          tail.textContent = tailParts.join(' · ');
+          streamLine.append(sep, tail);
+        }
+
+        const saveLine = document.createElement('div');
+        saveLine.className = 'vod-meta-save mono';
+        const fallbackStem = meta.channel ? meta.channel + '_VOD' : 'Kick_VOD';
+        saveLine.textContent = 'Saves as: ' + sanitizeFilename(meta.title, fallbackStem) + '.' + currentExt;
+
+        info.append(top, metaLine, streamLine, saveLine);
+        body.append(thumbWrap, info);
+        panel.appendChild(body);
       }
 
       function cancelOngoingDownload() {
@@ -1732,6 +2415,9 @@
         const url = els.urlInput.value.trim();
         if (!url || !folder) return;
 
+        const prefetchedMeta =
+          vodPreviewState.status === 'ready' && vodPreviewState.sourceUrl === url ? vodPreviewState.meta : null;
+
         if (activeTimer) {
           clearInterval(activeTimer);
           activeTimer = null;
@@ -1742,27 +2428,33 @@
 
         activeCanceled = false;
         activeItem = {
-          title: 'Extracting VOD: ' + url,
+          title: prefetchedMeta ? prefetchedMeta.title : 'Extracting VOD: ' + url,
           resolution: resVal,
           format: fmtVal,
           folder,
           pct: 4,
-          statusText: 'Extracting Master M3U8 URL from Kick...'
+          statusText: prefetchedMeta
+            ? 'Preparing stream via yt-dlp + ffmpeg...'
+            : 'Extracting Master M3U8 URL from Kick...'
         };
         els.urlInput.value = '';
         updateDownloadButtonState();
+        dismissVodPreview();
         renderActiveQueue();
 
-        logLine('[extractor] Analyzing URL: ' + url);
-
-        let meta = { m3u8: url, title: 'Kick_VOD', sourceType: 'Direct' };
-        try {
-          meta = await extractKickVodReal(url);
-          if (activeCanceled) return;
-          logLine(`[extractor] Extracted '${meta.title}' (${meta.sourceType}): ${meta.m3u8}`);
-        } catch (err) {
-          if (activeCanceled) return;
-          logLine(`[extractor error] ${err.message}`);
+        let meta = prefetchedMeta || { m3u8: url, title: 'Kick_VOD', sourceType: 'Direct' };
+        if (prefetchedMeta) {
+          logLine(`[extractor] Using prefetched metadata for '${meta.title}' (${meta.sourceType}): ${meta.m3u8}`);
+        } else {
+          logLine('[extractor] Analyzing URL: ' + url);
+          try {
+            meta = await extractKickVodReal(url);
+            if (activeCanceled) return;
+            logLine(`[extractor] Extracted '${meta.title}' (${meta.sourceType}): ${meta.m3u8}`);
+          } catch (err) {
+            if (activeCanceled) return;
+            logLine(`[extractor error] ${err.message}`);
+          }
         }
 
         if (activeCanceled || !activeItem) return;
@@ -1843,6 +2535,7 @@
       }
 
       function formatBytes(bytes) {
+        if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + ' GB';
         if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
         if (bytes >= 1024) return Math.round(bytes / 1024) + ' KB';
         return bytes + ' B';

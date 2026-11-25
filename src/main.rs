@@ -283,6 +283,14 @@ fn save_app_config(cfg: &AppConfig) {
 }
 
 #[derive(Clone)]
+struct StreamVariantMeta {
+    label: String,
+    height: u32,
+    fps: Option<f64>,
+    bandwidth_bps: u64,
+}
+
+#[derive(Clone)]
 struct ExtractedVodMeta {
     m3u8_url: String,
     channel_slug: String,
@@ -290,6 +298,30 @@ struct ExtractedVodMeta {
     duration_formatted: String,
     duration_secs: Option<f64>,
     source_type: String,
+    thumbnail_url: Option<String>,
+    published_at: Option<String>,
+    category: Option<String>,
+    views: Option<u64>,
+    is_clip: bool,
+    variants: Vec<StreamVariantMeta>,
+}
+
+struct VodPreviewData {
+    source_url: String,
+    meta: ExtractedVodMeta,
+    thumbnail: Option<egui::TextureHandle>,
+}
+
+enum VodPreviewState {
+    Idle,
+    Loading {
+        url: String,
+    },
+    Ready(VodPreviewData),
+    Error {
+        url: String,
+        message: String,
+    },
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -365,6 +397,17 @@ enum WorkerEvent {
     Extracted(usize, ExtractedVodMeta),
     Progress(usize, f32, String),
     Finished(usize, bool, String, Option<String>),
+    VodPreviewReady {
+        request_id: u64,
+        source_url: String,
+        meta: ExtractedVodMeta,
+        thumbnail: Option<egui::ColorImage>,
+    },
+    VodPreviewFailed {
+        request_id: u64,
+        source_url: String,
+        error: String,
+    },
     UpdateChecked(Result<Option<UpdateReleaseInfo>, String>),
     UpdateProgress {
         tag_name: String,
@@ -845,6 +888,83 @@ fn non_empty_str<'a>(val: Option<&'a Value>) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
+fn format_kick_date(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]));
+    }
+    if s.len() >= 10 {
+        let bytes = s.as_bytes();
+        if bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[0..4].iter().all(|b| b.is_ascii_digit())
+            && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+            && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+        {
+            return Some(s[..10].to_string());
+        }
+    }
+    None
+}
+
+fn extract_category_name(obj: &Value) -> Option<String> {
+    obj.get("categories")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| non_empty_str(c.get("name")))
+        .or_else(|| non_empty_str(obj.get("category").and_then(|c| c.get("name"))))
+        .or_else(|| non_empty_str(obj.get("category")))
+        .map(str::to_string)
+}
+
+fn extract_thumbnail_url_from_val(obj: &Value) -> Option<String> {
+    non_empty_str(obj.get("thumbnail_url"))
+        .or_else(|| {
+            obj.get("thumbnail").and_then(|t| {
+                non_empty_str(Some(t))
+                    .or_else(|| non_empty_str(t.get("src")))
+                    .or_else(|| non_empty_str(t.get("url")))
+            })
+        })
+        .map(str::to_string)
+}
+
+fn extract_views_from_val(obj: &Value) -> Option<u64> {
+    for key in ["views", "view_count", "viewer_count"] {
+        if let Some(v) = obj.get(key) {
+            if let Some(n) = v.as_u64() {
+                if n > 0 {
+                    return Some(n);
+                }
+            } else if let Some(s) = v.as_str() {
+                if let Ok(n) = s.trim().parse::<u64>() {
+                    if n > 0 {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_supported_preview_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.len() < 12 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let is_kick = lower.contains("kick.com/")
+        && (lower.contains("/videos/")
+            || lower.contains("/video/")
+            || lower.contains("/clips/")
+            || lower.contains("/clip/")
+            || lower.contains("clip="));
+    let is_m3u8 =
+        (lower.starts_with("http://") || lower.starts_with("https://")) && lower.contains(".m3u8");
+    is_kick || is_m3u8
+}
+
 fn ytdlp_extract_kick_fallback(
     raw_url: &str,
     tx: &Sender<WorkerEvent>,
@@ -899,6 +1019,15 @@ fn ytdlp_extract_kick_fallback(
     } else {
         "Full VOD".to_string()
     };
+    let thumbnail_url = extract_thumbnail_url_from_val(&val);
+    let published_at = non_empty_str(val.get("upload_date"))
+        .or_else(|| non_empty_str(val.get("release_date")))
+        .and_then(format_kick_date);
+    let category = extract_category_name(&val);
+    let views = extract_views_from_val(&val);
+    let lower_raw = raw_url.to_ascii_lowercase();
+    let is_clip =
+        lower_raw.contains("/clips/") || lower_raw.contains("/clip/") || lower_raw.contains("clip=");
 
     Some(ExtractedVodMeta {
         m3u8_url,
@@ -907,6 +1036,12 @@ fn ytdlp_extract_kick_fallback(
         duration_formatted,
         duration_secs: duration_f64,
         source_type: "yt-dlp fallback".to_string(),
+        thumbnail_url,
+        published_at,
+        category,
+        views,
+        is_clip,
+        variants: Vec::new(),
     })
 }
 
@@ -931,9 +1066,9 @@ fn extract_kick_clip(
 
         if let Some(m3u8_url) = stream_url {
             let channel_slug =
-                non_empty_str(clip_obj.get("channel").and_then(|c| c.get("slug")))
+                non_empty_str(clip_obj.get("channel").and_then(|c| c.get("username")))
                     .or_else(|| {
-                        non_empty_str(clip_obj.get("channel").and_then(|c| c.get("username")))
+                        non_empty_str(clip_obj.get("channel").and_then(|c| c.get("slug")))
                     })
                     .unwrap_or(if user_hint.is_empty() {
                         "kick_clip"
@@ -962,6 +1097,13 @@ fn extract_kick_clip(
                 "Clip".to_string()
             };
 
+            let thumbnail_url = extract_thumbnail_url_from_val(clip_obj);
+            let published_at = non_empty_str(clip_obj.get("created_at"))
+                .or_else(|| non_empty_str(clip_obj.get("started_at")))
+                .and_then(format_kick_date);
+            let category = extract_category_name(clip_obj);
+            let views = extract_views_from_val(clip_obj);
+
             return Ok(ExtractedVodMeta {
                 m3u8_url: m3u8_url.to_string(),
                 channel_slug,
@@ -969,6 +1111,12 @@ fn extract_kick_clip(
                 duration_formatted,
                 duration_secs: duration_f64,
                 source_type: "Kick Clip API".to_string(),
+                thumbnail_url,
+                published_at,
+                category,
+                views,
+                is_clip: true,
+                variants: Vec::new(),
             });
         }
     }
@@ -999,6 +1147,12 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
             duration_formatted: "Live/VOD".to_string(),
             duration_secs: None,
             source_type: "Direct M3U8 URL".to_string(),
+            thumbnail_url: None,
+            published_at: None,
+            category: None,
+            views: None,
+            is_clip: false,
+            variants: Vec::new(),
         });
     }
 
@@ -1216,6 +1370,34 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
         None
     };
 
+    let thumbnail_url = ls
+        .and_then(extract_thumbnail_url_from_val)
+        .or_else(|| extract_thumbnail_url_from_val(vod))
+        .or_else(|| v2_matched_obj.as_ref().and_then(extract_thumbnail_url_from_val));
+
+    let published_at = [
+        ls.and_then(|l| l.get("start_time")).and_then(|s| s.as_str()),
+        ls.and_then(|l| l.get("created_at")).and_then(|s| s.as_str()),
+        vod.get("start_time").and_then(|s| s.as_str()),
+        vod.get("created_at").and_then(|s| s.as_str()),
+        v2_matched_obj
+            .as_ref()
+            .and_then(|m| m.get("start_time").or_else(|| m.get("created_at")))
+            .and_then(|s| s.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(format_kick_date);
+
+    let category = ls
+        .and_then(extract_category_name)
+        .or_else(|| extract_category_name(vod))
+        .or_else(|| v2_matched_obj.as_ref().and_then(extract_category_name));
+
+    let views = extract_views_from_val(vod)
+        .or_else(|| ls.and_then(extract_views_from_val))
+        .or_else(|| v2_matched_obj.as_ref().and_then(extract_views_from_val));
+
     // 2. Direct source URL from Kick API (v1 or v2)
     let direct_source = non_empty_str(vod.get("source")).or_else(|| {
         non_empty_str(v2_matched_obj.as_ref().and_then(|m| m.get("source")))
@@ -1229,21 +1411,17 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
             duration_formatted,
             duration_secs: duration_secs_opt,
             source_type: "Source URL from API".to_string(),
+            thumbnail_url,
+            published_at,
+            category,
+            views,
+            is_clip: false,
+            variants: Vec::new(),
         });
     }
 
     // 3. Reconstruct AWS IVS path from thumbnail & UTC timestamp + prefixes.json
-    let thumb_str = ls
-        .and_then(|l| l.get("thumbnail"))
-        .and_then(|t| t.as_str().or_else(|| t.get("src").and_then(|s| s.as_str())))
-        .or_else(|| {
-            vod.get("thumbnail").and_then(|t| {
-                t.as_str()
-                    .or_else(|| t.get("src").and_then(|s| s.as_str()))
-                    .or_else(|| t.get("url").and_then(|s| s.as_str()))
-            })
-        })
-        .unwrap_or("");
+    let thumb_str = thumbnail_url.as_deref().unwrap_or("");
 
     let (session, segment) = extract_thumb_ids(thumb_str)
         .ok_or_else(|| "Thumbnail session/segment extraction failed".to_string())?;
@@ -1289,6 +1467,12 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                 duration_formatted,
                 duration_secs: duration_secs_opt,
                 source_type: "Direct URL (no prefix)".to_string(),
+                thumbnail_url,
+                published_at,
+                category,
+                views,
+                is_clip: false,
+                variants: Vec::new(),
             });
         }
     }
@@ -1309,6 +1493,12 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                     duration_formatted,
                     duration_secs: duration_secs_opt,
                     source_type: format!("Found with prefix: {}", prefix),
+                    thumbnail_url,
+                    published_at,
+                    category,
+                    views,
+                    is_clip: false,
+                    variants: Vec::new(),
                 });
             }
         }
@@ -1636,6 +1826,208 @@ fn probe_hls_stream(m3u8_url: &str, res: Resolution) -> StreamProbeInfo {
         info.duration_secs = Some(total_dur);
     }
     info
+}
+
+fn probe_hls_variants_for_preview(
+    m3u8_url: &str,
+    need_duration: bool,
+) -> (Vec<StreamVariantMeta>, Option<f64>) {
+    if !m3u8_url.to_ascii_lowercase().contains(".m3u8") {
+        return (Vec::new(), None);
+    }
+    let Some(master_text) = fetch_text_with_kick_headers(m3u8_url) else {
+        return (Vec::new(), None);
+    };
+    if !master_text.contains("#EXTM3U") {
+        return (Vec::new(), None);
+    }
+
+    let mut variants: Vec<StreamVariantMeta> = Vec::new();
+    let mut first_variant_uri: Option<String> = None;
+
+    if master_text.contains("#EXT-X-STREAM-INF:") {
+        let mut pending: Option<(u32, Option<f64>, u64)> = None;
+        for raw_line in master_text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+                let height = parse_m3u8_attr(attrs, "RESOLUTION")
+                    .and_then(|r| r.split('x').nth(1))
+                    .and_then(|h| h.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let fps = parse_m3u8_attr(attrs, "FRAME-RATE")
+                    .and_then(|f| f.parse::<f64>().ok())
+                    .filter(|&f| f.is_finite() && f > 0.5 && f <= 240.0);
+                let bandwidth_bps = parse_m3u8_attr(attrs, "BANDWIDTH")
+                    .and_then(|b| b.parse::<u64>().ok())
+                    .unwrap_or(0);
+                pending = Some((height, fps, bandwidth_bps));
+            } else if !line.starts_with('#') {
+                if let Some((height, fps_attr, bandwidth_bps)) = pending.take() {
+                    if first_variant_uri.is_none() {
+                        first_variant_uri = Some(line.to_string());
+                    }
+                    let fps = fps_attr.or_else(|| infer_fps_from_variant_uri(line));
+                    let label = if height > 0 {
+                        if let Some(f) = fps.filter(|&f| f >= 48.0) {
+                            format!("{}p{}", height, f.round() as u32)
+                        } else {
+                            format!("{}p", height)
+                        }
+                    } else if bandwidth_bps > 0 {
+                        "Source".to_string()
+                    } else {
+                        continue;
+                    };
+                    if let Some(existing) = variants.iter_mut().find(|v| v.label == label) {
+                        if bandwidth_bps > existing.bandwidth_bps {
+                            existing.bandwidth_bps = bandwidth_bps;
+                        }
+                    } else {
+                        variants.push(StreamVariantMeta {
+                            label,
+                            height,
+                            fps,
+                            bandwidth_bps,
+                        });
+                    }
+                }
+            }
+        }
+        variants.sort_by(|a, b| {
+            b.height
+                .cmp(&a.height)
+                .then_with(|| {
+                    b.fps
+                        .map(|f| (f * 100.0) as u64)
+                        .unwrap_or(0)
+                        .cmp(&a.fps.map(|f| (f * 100.0) as u64).unwrap_or(0))
+                })
+                .then_with(|| b.bandwidth_bps.cmp(&a.bandwidth_bps))
+        });
+    }
+
+    let mut probed_duration: Option<f64> = None;
+    if need_duration {
+        let media_text = if let Some(uri) = first_variant_uri {
+            let media_url = resolve_relative_url(m3u8_url, &uri);
+            fetch_text_with_kick_headers(&media_url).unwrap_or_default()
+        } else {
+            master_text
+        };
+        let mut total_dur = 0.0_f64;
+        let mut segs = 0u64;
+        for line in media_text.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("#EXTINF:") {
+                let num_part = rest.split(',').next().unwrap_or("").trim();
+                if let Ok(sec) = num_part.parse::<f64>() {
+                    if sec.is_finite() && sec > 0.0 {
+                        total_dur += sec;
+                        segs += 1;
+                    }
+                }
+            }
+        }
+        if segs > 0 && total_dur > 0.0 {
+            probed_duration = Some(total_dur);
+        }
+    }
+
+    (variants, probed_duration)
+}
+
+fn fetch_thumbnail_color_image(url: &str) -> Option<egui::ColorImage> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return None;
+    }
+    let client = shared_http_client().ok()?;
+    let resp = client
+        .get(trimmed)
+        .header("Origin", "https://kick.com")
+        .header("Referer", "https://kick.com/")
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().ok()?;
+    if bytes.is_empty() || bytes.len() > 6 * 1024 * 1024 {
+        return None;
+    }
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let resized = decoded
+        .resize_to_fill(320, 180, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [resized.width() as usize, resized.height() as usize],
+        resized.as_raw(),
+    ))
+}
+
+fn compute_effective_slice_secs(
+    full_secs: Option<f64>,
+    start_t: &str,
+    end_t: &str,
+) -> (Option<f64>, bool) {
+    let start_secs = parse_hms_to_secs(start_t);
+    let end_secs = parse_hms_to_secs(end_t);
+    let is_sliced = start_secs.is_some() || end_secs.is_some();
+    let effective = match (start_secs, end_secs, full_secs) {
+        (Some(s), Some(e), _) if e > s => Some(e - s),
+        (None, Some(e), Some(full)) if e > 0.0 => Some(e.min(full)),
+        (None, Some(e), None) if e > 0.0 => Some(e),
+        (Some(s), None, Some(full)) if full > s => Some(full - s),
+        (None, None, Some(full)) if full > 0.0 => Some(full),
+        _ => full_secs.filter(|&d| d > 0.0),
+    };
+    (effective, is_sliced)
+}
+
+fn estimate_download_size_bytes(
+    meta: &ExtractedVodMeta,
+    res: Resolution,
+    start_t: &str,
+    end_t: &str,
+) -> Option<u64> {
+    let (effective_secs, _) = compute_effective_slice_secs(meta.duration_secs, start_t, end_t);
+    let dur = effective_secs.filter(|&d| d > 0.0)?;
+    let bandwidth_bps = if res == Resolution::AudioOnly {
+        128_000u64
+    } else {
+        if meta.variants.is_empty() {
+            return None;
+        }
+        let (max_h, max_fps): (Option<u32>, Option<f64>) = match res {
+            Resolution::R1080p60 => (Some(1080), Some(60.5)),
+            Resolution::R1080p => (Some(1080), None),
+            Resolution::R720p60 => (Some(720), Some(60.5)),
+            Resolution::R720p => (Some(720), None),
+            Resolution::R480p => (Some(480), None),
+            Resolution::R360p => (Some(360), None),
+            Resolution::AudioOnly => (None, None),
+        };
+        let chosen = meta
+            .variants
+            .iter()
+            .find(|v| {
+                let h_ok = max_h.map(|mh| v.height == 0 || v.height <= mh).unwrap_or(true);
+                let f_ok = match (max_fps, v.fps) {
+                    (Some(mf), Some(vf)) => vf <= mf,
+                    _ => true,
+                };
+                h_ok && f_ok
+            })
+            .or_else(|| meta.variants.first())?;
+        if chosen.bandwidth_bps == 0 {
+            return None;
+        }
+        chosen.bandwidth_bps
+    };
+    Some(((bandwidth_bps as f64 / 8.0) * dur).round() as u64)
 }
 
 fn probe_with_ffprobe(url: &str) -> StreamProbeInfo {
@@ -2233,7 +2625,9 @@ fn is_allowed_github_download_url(url: &str) -> bool {
 }
 
 fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1_048_576 {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else if bytes >= 1024 {
         format!("{:.0} KB", bytes as f64 / 1024.0)
@@ -2747,6 +3141,11 @@ struct FiveKdApp {
     output_path: String,
     paste_notice: Option<(String, Instant)>,
 
+    preview_state: VodPreviewState,
+    preview_request_id: u64,
+    last_observed_url: String,
+    pending_preview_url: Option<(String, Instant)>,
+
     check_updates_on_launch: bool,
     github_repo: String,
     update_state: UpdateState,
@@ -2851,6 +3250,10 @@ impl FiveKdApp {
             container_ext: ContainerExt::from_str(&cfg.container_ext),
             output_path: cfg.output_path,
             paste_notice: None,
+            preview_state: VodPreviewState::Idle,
+            preview_request_id: 0,
+            last_observed_url: String::new(),
+            pending_preview_url: None,
             check_updates_on_launch: cfg.check_updates_on_launch,
             github_repo: effective_repo,
             update_state: UpdateState::Idle,
@@ -3019,11 +3422,76 @@ impl FiveKdApp {
         }
     }
 
+    fn dismiss_vod_preview(&mut self) {
+        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+        self.pending_preview_url = None;
+        self.preview_state = VodPreviewState::Idle;
+    }
+
+    fn trigger_vod_preview(&mut self, raw_url: String) {
+        let trimmed = raw_url.trim().to_string();
+        if !looks_like_supported_preview_url(&trimmed) {
+            self.dismiss_vod_preview();
+            return;
+        }
+        self.preview_request_id = self.preview_request_id.wrapping_add(1);
+        let req_id = self.preview_request_id;
+        self.pending_preview_url = None;
+        self.preview_state = VodPreviewState::Loading {
+            url: trimmed.clone(),
+        };
+
+        let tx = self.tx.clone();
+        let notifier = self.notifier.clone();
+        thread::spawn(move || {
+            match extract_kick_vod(&trimmed, &tx) {
+                Ok(mut meta) => {
+                    let (variants, probed_dur) = probe_hls_variants_for_preview(
+                        &meta.m3u8_url,
+                        meta.duration_secs.is_none(),
+                    );
+                    if !variants.is_empty() {
+                        meta.variants = variants;
+                    }
+                    if meta.duration_secs.is_none() {
+                        if let Some(d) = probed_dur {
+                            meta.duration_secs = Some(d);
+                            meta.duration_formatted = format_secs_hms(d);
+                        }
+                    }
+                    let thumbnail = meta
+                        .thumbnail_url
+                        .as_deref()
+                        .and_then(fetch_thumbnail_color_image);
+                    let _ = tx.send(WorkerEvent::VodPreviewReady {
+                        request_id: req_id,
+                        source_url: trimmed,
+                        meta,
+                        thumbnail,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(WorkerEvent::VodPreviewFailed {
+                        request_id: req_id,
+                        source_url: trimmed,
+                        error: err,
+                    });
+                }
+            }
+            notifier.wake_immediate();
+        });
+    }
+
     fn start_download(&mut self) {
         let raw_url = self.url_input.trim().to_string();
         if raw_url.is_empty() || !self.has_chosen_folder() {
             return;
         }
+
+        let prefetched_meta = match &self.preview_state {
+            VodPreviewState::Ready(data) if data.source_url == raw_url => Some(data.meta.clone()),
+            _ => None,
+        };
 
         let id = self.next_id;
         self.next_id += 1;
@@ -3037,16 +3505,26 @@ impl FiveKdApp {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let child_pid = Arc::new(Mutex::new(None));
 
+        let initial_title = prefetched_meta
+            .as_ref()
+            .map(|m| format!("{} ({})", m.session_title, m.duration_formatted))
+            .unwrap_or_else(|| format!("Extracting VOD: {}", raw_url));
+        let initial_status = if prefetched_meta.is_some() {
+            "Preparing stream via yt-dlp + ffmpeg...".to_string()
+        } else {
+            "Extracting Master M3U8 URL from Kick...".to_string()
+        };
+
         let item = DownloadItem {
             id,
-            title: format!("Extracting VOD: {}", raw_url),
+            title: initial_title,
             url: raw_url.clone(),
             output_path: custom_out.clone(),
             saved_file_path: None,
             resolution: res.short_label(),
             format: ext.upper(),
             progress: 0.0,
-            status_text: "Extracting Master M3U8 URL from Kick...".to_string(),
+            status_text: initial_status,
             status: DownloadStatus::Active,
             cancel_flag: cancel_flag.clone(),
             child_pid: child_pid.clone(),
@@ -3054,37 +3532,49 @@ impl FiveKdApp {
 
         self.active_downloads.insert(0, item);
         self.url_input.clear();
+        self.last_observed_url.clear();
+        self.dismiss_vod_preview();
 
         let tx = self.tx.clone();
         let notifier = self.notifier.clone();
         thread::spawn(move || {
-            let _ = tx.send(WorkerEvent::Log(format!(
-                "[extractor] Analyzing URL: {}",
-                raw_url
-            )));
-            notifier.wake_immediate();
+            let extracted = if let Some(meta) = prefetched_meta {
+                let _ = tx.send(WorkerEvent::Log(format!(
+                    "[extractor] Using prefetched metadata for '{}' ({}): {}",
+                    meta.session_title, meta.source_type, meta.m3u8_url
+                )));
+                let _ = tx.send(WorkerEvent::Extracted(id, meta.clone()));
+                notifier.wake_immediate();
+                meta
+            } else {
+                let _ = tx.send(WorkerEvent::Log(format!(
+                    "[extractor] Analyzing URL: {}",
+                    raw_url
+                )));
+                notifier.wake_immediate();
 
-            let extracted = match extract_kick_vod(&raw_url, &tx) {
-                Ok(meta) => {
-                    if cancel_flag.load(Ordering::SeqCst) {
+                match extract_kick_vod(&raw_url, &tx) {
+                    Ok(meta) => {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let _ = tx.send(WorkerEvent::Log(format!(
+                            "[extractor] Extracted '{}' ({}): {}",
+                            meta.session_title, meta.source_type, meta.m3u8_url
+                        )));
+                        let _ = tx.send(WorkerEvent::Extracted(id, meta.clone()));
+                        notifier.wake_immediate();
+                        meta
+                    }
+                    Err(e) => {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let _ = tx.send(WorkerEvent::Log(format!("[extractor error] {}", e)));
+                        let _ = tx.send(WorkerEvent::Finished(id, false, e, None));
+                        notifier.wake_immediate();
                         return;
                     }
-                    let _ = tx.send(WorkerEvent::Log(format!(
-                        "[extractor] Extracted '{}' ({}): {}",
-                        meta.session_title, meta.source_type, meta.m3u8_url
-                    )));
-                    let _ = tx.send(WorkerEvent::Extracted(id, meta.clone()));
-                    notifier.wake_immediate();
-                    meta
-                }
-                Err(e) => {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let _ = tx.send(WorkerEvent::Log(format!("[extractor error] {}", e)));
-                    let _ = tx.send(WorkerEvent::Finished(id, false, e, None));
-                    notifier.wake_immediate();
-                    return;
                 }
             };
 
@@ -3297,7 +3787,7 @@ impl FiveKdApp {
         });
     }
 
-    fn poll_events(&mut self) {
+    fn poll_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 WorkerEvent::Log(line) => {
@@ -3335,6 +3825,39 @@ impl FiveKdApp {
                         self.completed_downloads.insert(0, item);
                     }
                 }
+                WorkerEvent::VodPreviewReady {
+                    request_id,
+                    source_url,
+                    meta,
+                    thumbnail,
+                } => {
+                    if request_id == self.preview_request_id {
+                        let tex = thumbnail.map(|img| {
+                            ctx.load_texture(
+                                format!("vod_preview_thumb_{}", request_id),
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            )
+                        });
+                        self.preview_state = VodPreviewState::Ready(VodPreviewData {
+                            source_url,
+                            meta,
+                            thumbnail: tex,
+                        });
+                    }
+                }
+                WorkerEvent::VodPreviewFailed {
+                    request_id,
+                    source_url,
+                    error,
+                } => {
+                    if request_id == self.preview_request_id {
+                        self.preview_state = VodPreviewState::Error {
+                            url: source_url,
+                            message: error,
+                        };
+                    }
+                }
                 WorkerEvent::UpdateChecked(result) => match result {
                     Ok(Some(info)) => {
                         self.update_state = UpdateState::Available(info);
@@ -3369,6 +3892,435 @@ impl FiveKdApp {
                 }
             }
         }
+    }
+
+    fn render_vod_metadata_panel(&mut self, ui: &mut egui::Ui) {
+        enum PanelAction {
+            None,
+            Dismiss,
+            Refresh(String),
+        }
+
+        let mut action = PanelAction::None;
+
+        match &self.preview_state {
+            VodPreviewState::Idle => return,
+            VodPreviewState::Loading { url } => {
+                let url_display = url.clone();
+                egui::Frame::none()
+                    .fill(BG_SURFACE)
+                    .rounding(Rounding::same(10.0))
+                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(14.0, 11.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let close_w = 64.0;
+                            let left_w = (ui.available_width() - close_w - 10.0).max(120.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(left_w, 26.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_max_width(left_w);
+                                    ui.label(
+                                        RichText::new("Fetching VOD metadata...")
+                                            .size(12.5)
+                                            .strong()
+                                            .color(ACCENT_GREEN),
+                                    );
+                                    ui.label(RichText::new("·").size(12.0).color(TEXT_MUTED));
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&url_display)
+                                                .size(11.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(TEXT_MUTED),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let cancel_btn = styled_secondary_btn(
+                                        "Cancel",
+                                        TEXT_MUTED,
+                                        BORDER_HOVER,
+                                        Vec2::new(close_w, 26.0),
+                                    );
+                                    if ui.add(cancel_btn).clicked() {
+                                        action = PanelAction::Dismiss;
+                                    }
+                                },
+                            );
+                        });
+                    });
+            }
+            VodPreviewState::Error { url, message } => {
+                let retry_url = url.clone();
+                let err_msg = message.clone();
+                egui::Frame::none()
+                    .fill(BG_SURFACE)
+                    .rounding(Rounding::same(10.0))
+                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(14.0, 11.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let right_w = 96.0;
+                            let left_w = (ui.available_width() - right_w - 10.0).max(120.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(left_w, 26.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.set_max_width(left_w);
+                                    ui.label(
+                                        RichText::new("Preview unavailable")
+                                            .size(12.5)
+                                            .strong()
+                                            .color(STATUS_CANCELED),
+                                    );
+                                    ui.label(RichText::new("·").size(12.0).color(TEXT_MUTED));
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&err_msg)
+                                                .size(11.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(TEXT_MUTED),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let close_btn = styled_secondary_btn(
+                                        "×",
+                                        TEXT_MUTED,
+                                        BORDER_HOVER,
+                                        Vec2::new(26.0, 26.0),
+                                    );
+                                    if ui.add(close_btn).on_hover_text("Dismiss").clicked() {
+                                        action = PanelAction::Dismiss;
+                                    }
+                                    let retry_btn = styled_secondary_btn(
+                                        "Retry",
+                                        TEXT_PRIMARY,
+                                        BORDER_HOVER,
+                                        Vec2::new(60.0, 26.0),
+                                    );
+                                    if ui.add(retry_btn).clicked() {
+                                        action = PanelAction::Refresh(retry_url.clone());
+                                    }
+                                },
+                            );
+                        });
+                    });
+            }
+            VodPreviewState::Ready(data) => {
+                let meta = &data.meta;
+                let source_url = data.source_url.clone();
+                let (effective_secs, is_sliced) = compute_effective_slice_secs(
+                    meta.duration_secs,
+                    &self.start_time,
+                    &self.end_time,
+                );
+                let est_bytes = estimate_download_size_bytes(
+                    meta,
+                    self.resolution,
+                    &self.start_time,
+                    &self.end_time,
+                );
+                let fallback_stem = if meta.channel_slug.is_empty() {
+                    "Kick_VOD".to_string()
+                } else {
+                    format!("{}_VOD", meta.channel_slug)
+                };
+                let save_preview_name = format!(
+                    "{}.{}",
+                    sanitize_filename(&meta.session_title, &fallback_stem),
+                    self.container_ext.as_str()
+                );
+
+                egui::Frame::none()
+                    .fill(BG_SURFACE)
+                    .rounding(Rounding::same(10.0))
+                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 14.0;
+
+                            // 16:9 Thumbnail Preview (with clean fallback and duration stamp)
+                            let thumb_size = Vec2::new(160.0, 90.0);
+                            let thumb_rect = if let Some(tex) = &data.thumbnail {
+                                let resp = ui.add(
+                                    egui::Image::from_texture((tex.id(), thumb_size))
+                                        .rounding(Rounding::same(6.0)),
+                                );
+                                ui.painter().rect_stroke(
+                                    resp.rect,
+                                    Rounding::same(6.0),
+                                    Stroke::new(1.0, BORDER_SUBTLE),
+                                );
+                                resp.rect
+                            } else {
+                                let (rect, _) = ui.allocate_exact_size(thumb_size, Sense::hover());
+                                let p = ui.painter();
+                                p.rect_filled(rect, Rounding::same(6.0), BG_ELEVATED);
+                                p.rect_stroke(
+                                    rect,
+                                    Rounding::same(6.0),
+                                    Stroke::new(1.0, BORDER_SUBTLE),
+                                );
+                                let c = rect.center();
+                                p.add(Shape::convex_polygon(
+                                    vec![
+                                        Pos2::new(c.x - 6.0, c.y - 8.5),
+                                        Pos2::new(c.x - 6.0, c.y + 8.5),
+                                        Pos2::new(c.x + 8.5, c.y),
+                                    ],
+                                    TEXT_MUTED,
+                                    Stroke::NONE,
+                                ));
+                                rect
+                            };
+
+                            if meta.duration_secs.is_some() {
+                                let galley = ui.painter().layout_no_wrap(
+                                    meta.duration_formatted.clone(),
+                                    FontId::monospace(10.5),
+                                    TEXT_PRIMARY,
+                                );
+                                let badge_size = galley.size() + Vec2::new(10.0, 4.0);
+                                let badge_rect = Rect::from_min_size(
+                                    Pos2::new(
+                                        thumb_rect.right() - badge_size.x - 5.0,
+                                        thumb_rect.bottom() - badge_size.y - 5.0,
+                                    ),
+                                    badge_size,
+                                );
+                                ui.painter().rect_filled(
+                                    badge_rect,
+                                    Rounding::same(4.0),
+                                    Color32::from_rgba_unmultiplied(0, 0, 0, 215),
+                                );
+                                ui.painter().galley(
+                                    badge_rect.min + Vec2::new(5.0, 2.0),
+                                    galley,
+                                    TEXT_PRIMARY,
+                                );
+                            }
+
+                            // Right Metadata Column (Zero-Pill clean typographic hierarchy)
+                            let info_w = (ui.available_width()).max(160.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(info_w, thumb_size.y),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_max_width(info_w);
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+
+                                    // Row 1: Title + Refresh / Dismiss actions
+                                    ui.horizontal(|ui| {
+                                        let actions_w = 96.0;
+                                        let title_w = (ui.available_width() - actions_w).max(80.0);
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(title_w, 22.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.set_max_width(title_w);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&meta.session_title)
+                                                            .size(14.0)
+                                                            .strong()
+                                                            .color(TEXT_PRIMARY),
+                                                    )
+                                                    .truncate(),
+                                                )
+                                                .on_hover_text(&meta.session_title);
+                                            },
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let close_btn = styled_secondary_btn(
+                                                    "×",
+                                                    TEXT_MUTED,
+                                                    BORDER_HOVER,
+                                                    Vec2::new(24.0, 22.0),
+                                                );
+                                                if ui
+                                                    .add(close_btn)
+                                                    .on_hover_text("Hide metadata panel")
+                                                    .clicked()
+                                                {
+                                                    action = PanelAction::Dismiss;
+                                                }
+                                                let refresh_btn = styled_secondary_btn(
+                                                    "Refresh",
+                                                    TEXT_MUTED,
+                                                    BORDER_HOVER,
+                                                    Vec2::new(58.0, 22.0),
+                                                );
+                                                if ui
+                                                    .add(refresh_btn)
+                                                    .on_hover_text("Re-fetch VOD metadata")
+                                                    .clicked()
+                                                {
+                                                    action =
+                                                        PanelAction::Refresh(source_url.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+
+                                    // Row 2: Channel · Type · Category · Date · Views (unboxed text)
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.label(
+                                            RichText::new(&meta.channel_slug)
+                                                .size(12.0)
+                                                .strong()
+                                                .color(ACCENT_GREEN),
+                                        );
+                                        let kind_label = if meta.is_clip {
+                                            "Clip"
+                                        } else if meta.source_type == "Direct M3U8 URL" {
+                                            "HLS"
+                                        } else {
+                                            "VOD"
+                                        };
+                                        ui.label(RichText::new("·").size(12.0).color(TEXT_MUTED));
+                                        ui.label(
+                                            RichText::new(kind_label)
+                                                .size(12.0)
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        if let Some(ref cat) = meta.category {
+                                            ui.label(
+                                                RichText::new("·").size(12.0).color(TEXT_MUTED),
+                                            );
+                                            ui.label(
+                                                RichText::new(cat).size(12.0).color(TEXT_MUTED),
+                                            );
+                                        }
+                                        if let Some(ref dt) = meta.published_at {
+                                            ui.label(
+                                                RichText::new("·").size(12.0).color(TEXT_MUTED),
+                                            );
+                                            ui.label(
+                                                RichText::new(dt)
+                                                    .size(11.5)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(TEXT_MUTED),
+                                            );
+                                        }
+                                        if let Some(v) = meta.views {
+                                            ui.label(
+                                                RichText::new("·").size(12.0).color(TEXT_MUTED),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} views",
+                                                    format_with_commas(v)
+                                                ))
+                                                .size(11.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(TEXT_MUTED),
+                                            );
+                                        }
+                                    });
+
+                                    // Row 3: Duration/Slice · Available Qualities · Est. Size
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        if is_sliced {
+                                            if let Some(slice_s) = effective_secs {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "Slice {}",
+                                                        format_secs_hms(slice_s)
+                                                    ))
+                                                    .size(11.5)
+                                                    .family(FontFamily::Monospace)
+                                                    .strong()
+                                                    .color(ACCENT_GREEN),
+                                                );
+                                                ui.label(
+                                                    RichText::new("·").size(11.5).color(TEXT_MUTED),
+                                                );
+                                            }
+                                        } else {
+                                            ui.label(
+                                                RichText::new(&meta.duration_formatted)
+                                                    .size(11.5)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                            ui.label(
+                                                RichText::new("·").size(11.5).color(TEXT_MUTED),
+                                            );
+                                        }
+
+                                        let mut tail_parts: Vec<String> = Vec::new();
+                                        if !meta.variants.is_empty() {
+                                            let quals: Vec<&str> = meta
+                                                .variants
+                                                .iter()
+                                                .take(5)
+                                                .map(|v| v.label.as_str())
+                                                .collect();
+                                            tail_parts.push(quals.join(" / "));
+                                        } else {
+                                            tail_parts.push(meta.source_type.clone());
+                                        }
+                                        if let Some(bytes) = est_bytes {
+                                            tail_parts
+                                                .push(format!("Est. ~{}", format_bytes(bytes)));
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(tail_parts.join(" · "))
+                                                    .size(11.5)
+                                                    .family(FontFamily::Monospace)
+                                                    .color(TEXT_MUTED),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+
+                                    // Row 4: Live output filename preview
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "Saves as: {}",
+                                                save_preview_name
+                                            ))
+                                            .size(11.0)
+                                            .family(FontFamily::Monospace)
+                                            .color(TEXT_MUTED),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                        });
+                    });
+            }
+        }
+
+        match action {
+            PanelAction::None => {}
+            PanelAction::Dismiss => self.dismiss_vod_preview(),
+            PanelAction::Refresh(u) => self.trigger_vod_preview(u),
+        }
+
+        ui.add_space(12.0);
     }
 
     fn render_history_card(&self, ui: &mut egui::Ui, item: &DownloadItem) {
@@ -3456,7 +4408,7 @@ impl eframe::App for FiveKdApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_events();
+        self.poll_events(ctx);
 
         if self.should_exit_for_update {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -3473,6 +4425,26 @@ impl eframe::App for FiveKdApp {
         if let Some((_, created_at)) = &self.paste_notice {
             if created_at.elapsed() >= Duration::from_secs(2) {
                 self.paste_notice = None;
+            }
+        }
+
+        // Debounced auto-preview when user edits or pastes a Kick VOD/Clip URL
+        let current_url_trimmed = self.url_input.trim().to_string();
+        if current_url_trimmed != self.last_observed_url {
+            self.last_observed_url = current_url_trimmed.clone();
+            if current_url_trimmed.is_empty() {
+                self.dismiss_vod_preview();
+            } else if looks_like_supported_preview_url(&current_url_trimmed) {
+                self.pending_preview_url = Some((current_url_trimmed, Instant::now()));
+                ctx.request_repaint_after(Duration::from_millis(450));
+            } else {
+                self.dismiss_vod_preview();
+            }
+        }
+        if let Some((pending_url, scheduled_at)) = &self.pending_preview_url {
+            if scheduled_at.elapsed() >= Duration::from_millis(420) {
+                let to_fetch = pending_url.clone();
+                self.trigger_vod_preview(to_fetch);
             }
         }
 
@@ -3788,8 +4760,14 @@ impl eframe::App for FiveKdApp {
                                     .clicked()
                                 {
                                     if let Some(clip) = read_clipboard_text() {
-                                        self.url_input = clip;
+                                        self.url_input = clip.clone();
+                                        self.last_observed_url = clip.trim().to_string();
                                         self.paste_notice = None;
+                                        if looks_like_supported_preview_url(&clip) {
+                                            self.trigger_vod_preview(clip);
+                                        } else {
+                                            self.dismiss_vod_preview();
+                                        }
                                     } else {
                                         self.paste_notice =
                                             Some(("Clipboard is empty".to_string(), Instant::now()));
@@ -3859,6 +4837,9 @@ impl eframe::App for FiveKdApp {
                     }
 
                     ui.add_space(12.0);
+
+                    // 1b. VOD Metadata Panel (auto-appears when a Kick VOD/Clip/M3U8 URL is pasted)
+                    self.render_vod_metadata_panel(ui);
 
                     // 2. Stream Options Strip (Start Time, End Time, Quality, Format)
                     let mut config_dirty = false;
