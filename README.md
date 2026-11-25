@@ -149,15 +149,6 @@ To cross-compile for the other macOS architecture on the same Mac, add the targe
 
 ---
 
-### Automated Multi-Platform GitHub Releases (`.github/workflows/release.yml`)
-When pushed to GitHub:
-- Pushing a version tag (e.g., `git tag v1.1.0 && git push origin v1.1.0`), publishing a GitHub Release, or running **Multi-Platform Release Build** from the **Actions** tab automatically builds and publishes:
-  - `5KD-windows-x86_64-setup.exe` & `5KD-windows-arm64-setup.exe` (Inno Setup installers)
-  - `5KD-linux-x86_64.tar.gz`
-  - `5KD-macos-arm64.tar.gz` & `5KD-macos-x86_64.tar.gz`
-
----
-
 ## Usage
 
 1. **Select an Output Folder**: Click **Choose Folder** in the `Output Folder` bar to pick where your downloaded VODs and clips will be saved (remembered automatically on future launches).

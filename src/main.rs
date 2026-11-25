@@ -21,8 +21,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-#[cfg(target_os = "windows")]
-const DETACHED_PROCESS: u32 = 0x00000008;
 
 const APP_VERSION: &str = env!("FIVEKD_APP_VERSION");
 const GITHUB_REPO: &str = env!("FIVEKD_GITHUB_REPO");
@@ -2166,12 +2164,32 @@ fn updater_temp_dir() -> PathBuf {
     env::temp_dir().join("5kd_updater")
 }
 
-/// Deletes any leftover downloaded installers, staging folders, or updater helper scripts.
+/// Deletes any leftover downloaded installers, staging folders, or updater helper binaries.
 fn cleanup_leftover_update_files() {
     let dir = updater_temp_dir();
     if dir.exists() {
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+/// Retries cleanup briefly in the background so a just-exited Windows update helper
+/// has time to release its executable image lock before its folder is removed.
+fn cleanup_leftover_update_files_async() {
+    let dir = updater_temp_dir();
+    if !dir.exists() {
+        return;
+    }
+    if fs::remove_dir_all(&dir).is_ok() {
+        return;
+    }
+    thread::spawn(move || {
+        for _ in 0..16 {
+            thread::sleep(Duration::from_millis(250));
+            if !dir.exists() || fs::remove_dir_all(&dir).is_ok() {
+                break;
+            }
+        }
+    });
 }
 
 fn parse_version_numbers(tag: &str) -> Vec<u32> {
@@ -2331,8 +2349,158 @@ fn check_github_latest_release(repo: &str) -> Result<Option<UpdateReleaseInfo>, 
 }
 
 #[cfg(target_os = "windows")]
-fn escape_batch_percent(s: &str) -> String {
-    s.replace('%', "%%")
+const UPDATE_HELPER_FLAG: &str = "--5kd-apply-update";
+
+#[cfg(target_os = "windows")]
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        if !stripped.starts_with("UNC\\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_windows_pid_exit(pid: u32, timeout_ms: u32) {
+    use std::ffi::c_void;
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            dw_process_id: u32,
+        ) -> *mut c_void;
+        fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: u32) -> u32;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+    }
+
+    // SAFETY: Standard Win32 synchronization calls on a process handle checked for null
+    // before use and always closed before returning.
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if !handle.is_null() {
+            let _ = WaitForSingleObject(handle, timeout_ms);
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
+/// Runs headless when this GUI-subsystem binary is re-invoked from the temp folder
+/// as the Windows update helper. Avoids spawning cmd.exe/tasklist/findstr entirely,
+/// preventing any console or Windows Terminal window from appearing or hanging.
+#[cfg(target_os = "windows")]
+fn maybe_run_windows_update_helper() -> bool {
+    use std::ffi::OsString;
+
+    let mut args = env::args_os();
+    let _self_bin = args.next();
+    let Some(first) = args.next() else {
+        return false;
+    };
+    if first.to_str() != Some(UPDATE_HELPER_FLAG) {
+        return false;
+    }
+
+    let mut parent_pid: Option<u32> = None;
+    let mut installer_path: Option<PathBuf> = None;
+    let mut install_dir: Option<PathBuf> = None;
+    let mut exe_path: Option<PathBuf> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--pid") => {
+                if let Some(val) = args.next() {
+                    parent_pid = val.to_string_lossy().parse::<u32>().ok();
+                }
+            }
+            Some("--installer") => {
+                if let Some(val) = args.next() {
+                    installer_path = Some(PathBuf::from(val));
+                }
+            }
+            Some("--install-dir") => {
+                if let Some(val) = args.next() {
+                    install_dir = Some(PathBuf::from(val));
+                }
+            }
+            Some("--exe") => {
+                if let Some(val) = args.next() {
+                    exe_path = Some(PathBuf::from(val));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 1. Wait cleanly for the parent 5KD.exe process to exit
+    if let Some(pid) = parent_pid {
+        wait_for_windows_pid_exit(pid, 20_000);
+    }
+    // Brief grace period so Windows finishes releasing the executable image lock
+    thread::sleep(Duration::from_millis(350));
+
+    // 2. Run the downloaded Inno Setup installer silently and wait for completion
+    if let Some(ref installer) = installer_path {
+        let mut cmd = Command::new(installer);
+        cmd.args([
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+            "/FORCECLOSEAPPLICATIONS",
+        ]);
+        if let Some(ref dir) = install_dir {
+            let mut dir_arg = OsString::from("/DIR=");
+            dir_arg.push(dir.as_os_str());
+            cmd.arg(dir_arg);
+        }
+        cmd.current_dir(env::temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let _ = cmd.status();
+
+        // Remove the downloaded setup executable right after installation completes
+        for _ in 0..10 {
+            if !installer.exists() || fs::remove_file(installer).is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    // 3. Relaunch the updated 5KD.exe (retries briefly while filesystem/AV finalizes)
+    let fallback_exe = install_dir.as_ref().map(|d| d.join("5KD.exe"));
+    for _ in 0..16 {
+        let candidate = exe_path
+            .as_deref()
+            .filter(|p| p.exists())
+            .or_else(|| fallback_exe.as_deref().filter(|p| p.exists()));
+        if let Some(target) = candidate {
+            let mut launch = Command::new(target);
+            if let Some(parent) = target.parent() {
+                launch.current_dir(parent);
+            }
+            if launch
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -2342,51 +2510,39 @@ fn spawn_platform_installer_and_restart(
 ) -> Result<(), String> {
     let current_exe =
         env::current_exe().map_err(|e| format!("Could not resolve current executable: {}", e))?;
-    let install_dir = current_exe
+    let current_exe_clean = strip_windows_verbatim_prefix(&current_exe);
+    let install_dir = current_exe_clean
         .parent()
         .ok_or_else(|| "Could not resolve installation directory".to_string())?;
 
-    let install_dir_str = install_dir
-        .display()
-        .to_string()
-        .trim_end_matches('\\')
-        .to_string();
-    let installer_str = installer_path.display().to_string();
-    let current_exe_str = current_exe.display().to_string();
-    let updater_dir_str = updater_dir.display().to_string();
-    let pid = std::process::id();
+    let install_dir_clean = {
+        let s = install_dir.to_string_lossy();
+        if s.len() > 3 {
+            PathBuf::from(s.trim_end_matches('\\'))
+        } else {
+            install_dir.to_path_buf()
+        }
+    };
 
-    let script_path = updater_dir.join("apply_update.cmd");
-    let script_content = format!(
-        "@echo off\r\n\
-         setlocal\r\n\
-         set \"COUNT=0\"\r\n\
-         :waitloop\r\n\
-         tasklist /FI \"PID eq {pid}\" /FO CSV /NH 2>NUL | findstr /C:\",\\\"{pid}\\\",\" >NUL\r\n\
-         if \"%ERRORLEVEL%\"==\"0\" (\r\n\
-           set /a COUNT+=1\r\n\
-           if %COUNT% LSS 15 (\r\n\
-             timeout /t 1 /nobreak >NUL\r\n\
-             goto waitloop\r\n\
-           )\r\n\
-         )\r\n\
-         \"{installer}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /DIR=\"{install_dir}\"\r\n\
-         del /f /q \"{installer}\" 2>NUL\r\n\
-         start \"\" \"{exe}\"\r\n\
-         (goto) 2>nul & del /f /q \"%~f0\" & rmdir /s /q \"{updater_dir}\" 2>nul\r\n",
-        pid = pid,
-        installer = escape_batch_percent(&installer_str),
-        install_dir = escape_batch_percent(&install_dir_str),
-        exe = escape_batch_percent(&current_exe_str),
-        updater_dir = escape_batch_percent(&updater_dir_str),
-    );
+    // Copy this GUI-subsystem executable into the temp updater folder so it can run
+    // completely invisibly without locking the installed 5KD.exe or spawning cmd.exe.
+    let helper_exe = updater_dir.join("5KD-updater-helper.exe");
+    fs::copy(&current_exe_clean, &helper_exe)
+        .map_err(|e| format!("Failed to prepare Windows update helper: {}", e))?;
 
-    fs::write(&script_path, script_content)
-        .map_err(|e| format!("Failed to prepare Windows update script: {}", e))?;
+    let pid_str = std::process::id().to_string();
 
-    Command::new("cmd.exe")
-        .args(["/C", &script_path.display().to_string()])
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+    Command::new(&helper_exe)
+        .arg(UPDATE_HELPER_FLAG)
+        .arg("--pid")
+        .arg(&pid_str)
+        .arg("--installer")
+        .arg(installer_path)
+        .arg("--install-dir")
+        .arg(&install_dir_clean)
+        .arg("--exe")
+        .arg(&current_exe_clean)
+        .current_dir(env::temp_dir())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2659,7 +2815,7 @@ impl FiveKdApp {
         });
 
         // Remove any leftover installer or temporary update files from a prior update
-        cleanup_leftover_update_files();
+        cleanup_leftover_update_files_async();
 
         let cfg = load_app_config();
         let (tx, rx) = channel();
@@ -4631,6 +4787,11 @@ fn load_window_icon() -> Arc<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "windows")]
+    if maybe_run_windows_update_helper() {
+        return Ok(());
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("5KD - 5wi's Kick Downloader")
