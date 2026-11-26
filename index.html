@@ -13,6 +13,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js" defer></script>
     <style>
       :root {
         --bg-canvas: #000000;
@@ -728,6 +729,303 @@
         text-overflow: ellipsis;
       }
 
+      /* Interactive Trim Seek Bar & Floating Frame Preview Popover */
+      .vod-trim-section {
+        display: none;
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-subtle);
+        user-select: none;
+      }
+
+      .vod-trim-section.visible {
+        display: block;
+      }
+
+      .trim-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+      }
+
+      .trim-title {
+        font-size: 14.5px;
+        font-weight: 700;
+        color: var(--text-primary);
+      }
+
+      .trim-pills {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .trim-time-pill {
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-subtle);
+        border-radius: 9px;
+        padding: 5px 11px;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 12.5px;
+        font-weight: 600;
+        color: var(--text-primary);
+        cursor: pointer;
+        transition: border-color 0.14s ease, background-color 0.14s ease;
+      }
+
+      .trim-time-pill:hover {
+        border-color: var(--border-hover);
+      }
+
+      .trim-time-pill.active {
+        border-color: var(--accent-green);
+      }
+
+      .trim-time-colon {
+        color: var(--text-muted);
+        font-weight: 500;
+      }
+
+      .trim-arrow {
+        color: var(--text-muted);
+        font-size: 13px;
+      }
+
+      .trim-track-wrap {
+        position: relative;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        cursor: pointer;
+        touch-action: none;
+      }
+
+      .trim-track {
+        position: relative;
+        width: 100%;
+        height: 16px;
+        background: #2a2e34;
+        border: 1px solid var(--border-hover);
+        border-radius: 999px;
+      }
+
+      .trim-selection {
+        position: absolute;
+        top: -1px;
+        bottom: -1px;
+        background: var(--accent-green);
+        border-radius: 999px;
+        pointer-events: none;
+      }
+
+      .trim-hover-line {
+        position: absolute;
+        top: 1px;
+        bottom: 1px;
+        width: 2px;
+        background: rgba(244, 246, 248, 0.85);
+        border-radius: 1px;
+        transform: translateX(-50%);
+        pointer-events: none;
+        display: none;
+        z-index: 2;
+      }
+
+      .trim-hover-line.visible {
+        display: block;
+      }
+
+      .trim-handle {
+        position: absolute;
+        top: 50%;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        background: #000000;
+        border: 3.5px solid var(--accent-green);
+        box-shadow: 0 0 0 1.5px #080a0c;
+        transform: translate(-50%, -50%);
+        cursor: grab;
+        z-index: 4;
+        transition: transform 0.08s ease, box-shadow 0.12s ease;
+      }
+
+      .trim-handle.active {
+        box-shadow: 0 0 0 1.5px #080a0c, 0 0 0 2.75px rgba(244, 246, 248, 0.55);
+      }
+
+      .trim-handle.dragging {
+        cursor: grabbing;
+        transform: translate(-50%, -50%) scale(1.08);
+      }
+
+      .trim-frame-popover {
+        position: absolute;
+        bottom: calc(100% + 10px);
+        left: 0;
+        width: 212px;
+        background: #0a0b0d;
+        border: 1px solid var(--border-hover);
+        border-radius: 7px;
+        padding: 4px;
+        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.88);
+        pointer-events: none;
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 0.12s ease;
+        z-index: 80;
+      }
+
+      .trim-frame-popover.visible {
+        opacity: 1;
+        visibility: visible;
+      }
+
+      .trim-frame-viewport {
+        position: relative;
+        width: 202px;
+        height: 114px;
+        border-radius: 3px;
+        overflow: hidden;
+        background: var(--bg-elevated);
+        border: 1.5px solid #dde3ea;
+      }
+
+      .trim-frame-fallback-img,
+      .trim-frame-video {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+      }
+
+      .trim-frame-video {
+        opacity: 0;
+        transition: opacity 0.12s ease;
+      }
+
+      .trim-frame-video.ready {
+        opacity: 1;
+      }
+
+      .trim-frame-ts {
+        position: absolute;
+        right: 5px;
+        bottom: 5px;
+        background: rgba(0, 0, 0, 0.84);
+        color: var(--text-primary);
+        font-size: 10.5px;
+        font-weight: 600;
+        padding: 2px 5px;
+        border-radius: 4px;
+        line-height: 1.2;
+        z-index: 3;
+      }
+
+      .trim-frame-tag {
+        position: absolute;
+        left: 5px;
+        bottom: 5px;
+        background: rgba(0, 0, 0, 0.84);
+        color: var(--text-muted);
+        font-size: 9.5px;
+        font-weight: 600;
+        padding: 2px 5px;
+        border-radius: 4px;
+        line-height: 1.2;
+        z-index: 3;
+      }
+
+      .trim-frame-tag.loading {
+        color: var(--accent-green);
+      }
+
+      .trim-frame-caret {
+        position: absolute;
+        bottom: -6px;
+        left: 50%;
+        width: 10px;
+        height: 10px;
+        background: #0a0b0d;
+        border-right: 1px solid var(--border-hover);
+        border-bottom: 1px solid var(--border-hover);
+        transform: translateX(-50%) rotate(45deg);
+      }
+
+      .trim-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 8px 14px;
+        margin-top: 8px;
+      }
+
+      .trim-footer-left {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .trim-precise {
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .trim-reset-btn {
+        background: transparent;
+        border: none;
+        padding: 0;
+        color: var(--accent-green);
+        font-family: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: color 0.14s ease;
+      }
+
+      .trim-reset-btn:hover {
+        color: var(--accent-green-hover);
+        text-decoration: underline;
+      }
+
+      .trim-footer-right {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11.5px;
+        color: var(--text-muted);
+      }
+
+      .trim-keycap {
+        background: var(--bg-elevated);
+        color: var(--text-primary);
+        border: 1px solid var(--border-hover);
+        border-radius: 5px;
+        min-width: 24px;
+        height: 22px;
+        padding: 0 6px;
+        font-size: 11.5px;
+        font-weight: 600;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: border-color 0.14s ease, color 0.14s ease;
+      }
+
+      .trim-keycap:hover {
+        border-color: var(--accent-green);
+        color: var(--accent-green);
+      }
+
       /* Section Headers & Cards */
       .section-header {
         display: flex;
@@ -1218,16 +1516,61 @@
             <button type="submit" class="btn-primary" id="dl-btn" disabled title="Choose an output folder below before downloading">Download</button>
           </form>
 
-          <div id="vod-meta-panel" class="vod-meta-panel" aria-live="polite"></div>
+          <div id="vod-meta-panel" class="vod-meta-panel" aria-live="polite">
+            <div id="vod-meta-head"></div>
+            <div id="vod-trim-section" class="vod-trim-section">
+              <div class="trim-header">
+                <span class="trim-title">Trim</span>
+                <div class="trim-pills">
+                  <button type="button" id="trim-pill-start" class="trim-time-pill mono active" title="Select Start handle (use ← → to nudge)">
+                    <span id="trim-start-hh">00</span><span class="trim-time-colon">:</span><span id="trim-start-mm">00</span><span class="trim-time-colon">:</span><span id="trim-start-ss">00</span>
+                  </button>
+                  <span class="trim-arrow">→</span>
+                  <button type="button" id="trim-pill-end" class="trim-time-pill mono" title="Select End handle (use ← → to nudge)">
+                    <span id="trim-end-hh">00</span><span class="trim-time-colon">:</span><span id="trim-end-mm">00</span><span class="trim-time-colon">:</span><span id="trim-end-ss">00</span>
+                  </button>
+                </div>
+              </div>
+              <div id="trim-track-wrap" class="trim-track-wrap">
+                <div id="trim-frame-popover" class="trim-frame-popover">
+                  <div class="trim-frame-viewport">
+                    <img id="trim-frame-fallback" class="trim-frame-fallback-img" alt="" referrerpolicy="no-referrer" style="display:none;" />
+                    <video id="trim-preview-video" class="trim-frame-video" muted playsinline preload="auto"></video>
+                    <span id="trim-frame-tag" class="trim-frame-tag mono">SEEK</span>
+                    <span id="trim-frame-ts" class="trim-frame-ts mono">00:00:00</span>
+                  </div>
+                  <div id="trim-frame-caret" class="trim-frame-caret"></div>
+                </div>
+                <div id="trim-track" class="trim-track">
+                  <div id="trim-selection" class="trim-selection"></div>
+                  <div id="trim-hover-line" class="trim-hover-line"></div>
+                  <div id="trim-handle-start" class="trim-handle active" role="slider" aria-label="Trim start time" tabindex="0"></div>
+                  <div id="trim-handle-end" class="trim-handle" role="slider" aria-label="Trim end time" tabindex="0"></div>
+                </div>
+              </div>
+              <div class="trim-footer">
+                <div class="trim-footer-left">
+                  <span id="trim-precise-readout" class="trim-precise mono">00:00.000 → 00:00.000</span>
+                  <button type="button" id="trim-reset-btn" class="trim-reset-btn">Reset selection</button>
+                </div>
+                <div class="trim-footer-right">
+                  <span>Use</span>
+                  <button type="button" id="trim-nudge-left" class="trim-keycap mono" title="Nudge active handle backward">←</button>
+                  <button type="button" id="trim-nudge-right" class="trim-keycap mono" title="Nudge active handle forward">→</button>
+                  <span>keys for more precision</span>
+                </div>
+              </div>
+            </div>
+          </div>
 
           <div class="surface-bar options-bar">
             <div class="ctrl-group">
               <label for="start-time">Start</label>
-              <input id="start-time" class="ctrl-input mono" type="text" placeholder="00:00:00" oninput="renderVodPreviewPanel()" />
+              <input id="start-time" class="ctrl-input mono" type="text" placeholder="00:00:00" oninput="handleStartEndInput('start')" />
             </div>
             <div class="ctrl-group">
               <label for="end-time">End</label>
-              <input id="end-time" class="ctrl-input mono" type="text" placeholder="HH:MM:SS" oninput="renderVodPreviewPanel()" />
+              <input id="end-time" class="ctrl-input mono" type="text" placeholder="HH:MM:SS" oninput="handleStartEndInput('end')" />
             </div>
             <div class="ctrl-group">
               <span>Quality</span>
@@ -1422,6 +1765,18 @@
       let vodPreviewReqId = 0;
       let vodPreviewDebounce = null;
 
+      let trimActiveHandle = 'start';
+      let trimDragging = null;
+      let trimHoverFrac = null;
+      let trimHoverSecs = null;
+      let trimNudgeTimer = null;
+      let trimPopoverPinned = false;
+      let trimHlsInstance = null;
+      let trimLoadedStreamUrl = null;
+      let trimSeekDebounce = null;
+      let trimVideoSeeking = false;
+      let trimPendingSeekSecs = null;
+
       const els = {
         workspace: document.getElementById('workspace'),
         toast: document.getElementById('inline-toast'),
@@ -1429,6 +1784,32 @@
         startTime: document.getElementById('start-time'),
         endTime: document.getElementById('end-time'),
         vodMetaPanel: document.getElementById('vod-meta-panel'),
+        vodMetaHead: document.getElementById('vod-meta-head'),
+        vodTrimSection: document.getElementById('vod-trim-section'),
+        trimPillStart: document.getElementById('trim-pill-start'),
+        trimPillEnd: document.getElementById('trim-pill-end'),
+        trimStartHh: document.getElementById('trim-start-hh'),
+        trimStartMm: document.getElementById('trim-start-mm'),
+        trimStartSs: document.getElementById('trim-start-ss'),
+        trimEndHh: document.getElementById('trim-end-hh'),
+        trimEndMm: document.getElementById('trim-end-mm'),
+        trimEndSs: document.getElementById('trim-end-ss'),
+        trimTrackWrap: document.getElementById('trim-track-wrap'),
+        trimTrack: document.getElementById('trim-track'),
+        trimSelection: document.getElementById('trim-selection'),
+        trimHoverLine: document.getElementById('trim-hover-line'),
+        trimHandleStart: document.getElementById('trim-handle-start'),
+        trimHandleEnd: document.getElementById('trim-handle-end'),
+        trimFramePopover: document.getElementById('trim-frame-popover'),
+        trimFrameCaret: document.getElementById('trim-frame-caret'),
+        trimFrameFallback: document.getElementById('trim-frame-fallback'),
+        trimPreviewVideo: document.getElementById('trim-preview-video'),
+        trimFrameTag: document.getElementById('trim-frame-tag'),
+        trimFrameTs: document.getElementById('trim-frame-ts'),
+        trimPreciseReadout: document.getElementById('trim-precise-readout'),
+        trimResetBtn: document.getElementById('trim-reset-btn'),
+        trimNudgeLeft: document.getElementById('trim-nudge-left'),
+        trimNudgeRight: document.getElementById('trim-nudge-right'),
         outputPath: document.getElementById('output-path'),
         chooseFolderBtn: document.getElementById('choose-folder-btn'),
         dlBtn: document.getElementById('dl-btn'),
@@ -1575,8 +1956,10 @@
             lower.includes('/clips/') ||
             lower.includes('/clip/') ||
             lower.includes('clip='));
-        const isM3u8 = (lower.startsWith('http://') || lower.startsWith('https://')) && lower.includes('.m3u8');
-        return isKick || isM3u8;
+        const isDirectMedia =
+          (lower.startsWith('http://') || lower.startsWith('https://')) &&
+          (lower.includes('.m3u8') || lower.includes('.mp4'));
+        return isKick || isDirectMedia;
       }
 
       function handleUrlInput() {
@@ -1896,6 +2279,60 @@
         return null;
       }
 
+      function formatHmsInput(secs) {
+        const clamped = Math.max(0, Number(secs) || 0);
+        const rounded = Math.round(clamped);
+        if (Math.abs(clamped - rounded) < 0.005) {
+          return formatSecsHms(rounded);
+        }
+        const totalMs = Math.round(clamped * 1000);
+        const h = String(Math.floor(totalMs / 3600000)).padStart(2, '0');
+        const m = String(Math.floor((totalMs % 3600000) / 60000)).padStart(2, '0');
+        const s = String(Math.floor((totalMs % 60000) / 1000)).padStart(2, '0');
+        const ms = String(totalMs % 1000).padStart(3, '0');
+        return `${h}:${m}:${s}.${ms}`;
+      }
+
+      function formatTrimPrecise(secs) {
+        const totalMs = Math.max(0, Math.round((Number(secs) || 0) * 1000));
+        const h = Math.floor(totalMs / 3600000);
+        const m = Math.floor((totalMs % 3600000) / 60000);
+        const s = Math.floor((totalMs % 60000) / 1000);
+        const ms = String(totalMs % 1000).padStart(3, '0');
+        if (h > 0) {
+          return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${ms}`;
+        }
+        return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${ms}`;
+      }
+
+      function formatTrimHmsParts(secs) {
+        const total = Math.max(0, Math.floor(Number(secs) || 0));
+        return [
+          String(Math.floor(total / 3600)).padStart(2, '0'),
+          String(Math.floor((total % 3600) / 60)).padStart(2, '0'),
+          String(total % 60).padStart(2, '0')
+        ];
+      }
+
+      function resolveRelativeUrlWeb(base, rel) {
+        try {
+          return new URL(rel, base).href;
+        } catch (_) {
+          return rel;
+        }
+      }
+
+      function sumHlsExtinfDuration(txt) {
+        let total = 0;
+        const re = /#EXTINF:\s*([\d.]+)/gi;
+        let m;
+        while ((m = re.exec(txt)) !== null) {
+          const val = parseFloat(m[1]);
+          if (Number.isFinite(val) && val > 0) total += val;
+        }
+        return total > 0.5 ? total : null;
+      }
+
       function extractThumbUrl(obj) {
         if (!obj) return null;
         if (typeof obj.thumbnail_url === 'string' && obj.thumbnail_url.trim()) return obj.thumbnail_url.trim();
@@ -1925,61 +2362,102 @@
         return null;
       }
 
-      async function probeHlsVariantsWeb(m3u8Url) {
-        if (!m3u8Url || !m3u8Url.toLowerCase().includes('.m3u8')) return [];
-        const encoded = encodeURIComponent(m3u8Url);
-        for (const u of [VIDDASTRAGE_PROXY + encoded, m3u8Url]) {
+      async function fetchHlsTextWeb(targetUrl) {
+        const encoded = encodeURIComponent(targetUrl);
+        for (const u of [VIDDASTRAGE_PROXY + encoded, targetUrl]) {
           try {
             const r = await fetch(u);
             if (!r.ok) continue;
             const txt = await r.text();
-            if (!txt.includes('#EXT-X-STREAM-INF:')) continue;
-            const variants = [];
-            let pending = null;
-            for (const rawLine of txt.split(/\r?\n/)) {
-              const line = rawLine.trim();
-              if (!line) continue;
-              if (line.startsWith('#EXT-X-STREAM-INF:')) {
-                const resM = line.match(/RESOLUTION=\d+x(\d+)/i);
-                const fpsM = line.match(/FRAME-RATE=([\d.]+)/i);
-                const bwM = line.match(/BANDWIDTH=(\d+)/i);
-                pending = {
-                  height: resM ? parseInt(resM[1], 10) : 0,
-                  fps: fpsM ? parseFloat(fpsM[1]) : null,
-                  bandwidthBps: bwM ? parseInt(bwM[1], 10) : 0
-                };
-              } else if (!line.startsWith('#') && pending) {
-                const lower = line.toLowerCase();
-                let fps = pending.fps;
-                if (!fps) {
-                  if (lower.includes('p60') || lower.includes('60fps')) fps = 60;
-                  else if (lower.includes('p50')) fps = 50;
-                  else if (lower.includes('p30')) fps = 30;
-                }
-                const label =
-                  pending.height > 0
-                    ? fps && fps >= 48
-                      ? `${pending.height}p${Math.round(fps)}`
-                      : `${pending.height}p`
-                    : pending.bandwidthBps > 0
-                      ? 'Source'
-                      : null;
-                if (label) {
-                  const existing = variants.find((v) => v.label === label);
-                  if (existing) {
-                    existing.bandwidthBps = Math.max(existing.bandwidthBps, pending.bandwidthBps);
-                  } else {
-                    variants.push({ label, height: pending.height, fps, bandwidthBps: pending.bandwidthBps });
-                  }
-                }
-                pending = null;
-              }
-            }
-            variants.sort((a, b) => b.height - a.height || (b.fps || 0) - (a.fps || 0) || b.bandwidthBps - a.bandwidthBps);
-            return variants;
+            if (txt && txt.includes('#EXTM3U')) return txt;
           } catch (_) {}
         }
-        return [];
+        return null;
+      }
+
+      async function probeHlsVariantsWeb(m3u8Url) {
+        const empty = { variants: [], durationSecs: null, previewStreamUrl: null };
+        if (!m3u8Url || !m3u8Url.toLowerCase().includes('.m3u8')) return empty;
+        const txt = await fetchHlsTextWeb(m3u8Url);
+        if (!txt) return empty;
+
+        if (txt.includes('#EXT-X-STREAM-INF:')) {
+          const variants = [];
+          const allStreamEntries = [];
+          let pending = null;
+          for (const rawLine of txt.split(/\r?\n/)) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            if (line.startsWith('#EXT-X-STREAM-INF:')) {
+              const resM = line.match(/RESOLUTION=\d+x(\d+)/i);
+              const fpsM = line.match(/FRAME-RATE=([\d.]+)/i);
+              const bwM = line.match(/BANDWIDTH=(\d+)/i);
+              pending = {
+                height: resM ? parseInt(resM[1], 10) : 0,
+                fps: fpsM ? parseFloat(fpsM[1]) : null,
+                bandwidthBps: bwM ? parseInt(bwM[1], 10) : 0
+              };
+            } else if (!line.startsWith('#') && pending) {
+              const resolvedUri = resolveRelativeUrlWeb(m3u8Url, line);
+              const lower = line.toLowerCase();
+              let fps = pending.fps;
+              if (!fps) {
+                if (lower.includes('p60') || lower.includes('60fps')) fps = 60;
+                else if (lower.includes('p50')) fps = 50;
+                else if (lower.includes('p30')) fps = 30;
+              }
+              allStreamEntries.push({
+                height: pending.height,
+                fps,
+                bandwidthBps: pending.bandwidthBps,
+                uri: resolvedUri
+              });
+              const label =
+                pending.height > 0
+                  ? fps && fps >= 48
+                    ? `${pending.height}p${Math.round(fps)}`
+                    : `${pending.height}p`
+                  : pending.bandwidthBps > 0
+                    ? 'Source'
+                    : null;
+              if (label) {
+                const existing = variants.find((v) => v.label === label);
+                if (existing) {
+                  existing.bandwidthBps = Math.max(existing.bandwidthBps, pending.bandwidthBps);
+                } else {
+                  variants.push({ label, height: pending.height, fps, bandwidthBps: pending.bandwidthBps });
+                }
+              }
+              pending = null;
+            }
+          }
+          variants.sort((a, b) => b.height - a.height || (b.fps || 0) - (a.fps || 0) || b.bandwidthBps - a.bandwidthBps);
+
+          // Pick lowest-resolution video variant for fast frame preview seeking
+          const videoEntries = allStreamEntries.filter((e) => e.height > 0);
+          const pool = videoEntries.length ? videoEntries : allStreamEntries;
+          pool.sort((a, b) => (a.height || 99999) - (b.height || 99999) || (a.bandwidthBps || 9e9) - (b.bandwidthBps || 9e9));
+          const previewStreamUrl = pool.length ? pool[0].uri : m3u8Url;
+
+          let durationSecs = null;
+          if (previewStreamUrl) {
+            const mediaTxt = await fetchHlsTextWeb(previewStreamUrl);
+            if (mediaTxt && mediaTxt.includes('#EXTINF:')) {
+              durationSecs = sumHlsExtinfDuration(mediaTxt);
+            }
+          }
+          return { variants, durationSecs, previewStreamUrl };
+        }
+
+        if (txt.includes('#EXTINF:')) {
+          return {
+            variants: [],
+            durationSecs: sumHlsExtinfDuration(txt),
+            previewStreamUrl: m3u8Url
+          };
+        }
+
+        return empty;
       }
 
       async function extractKickVodReal(rawUrl) {
@@ -2023,7 +2501,31 @@
             views: null,
             isClip: false,
             sourceType: 'Direct M3U8 URL',
-            variants: []
+            variants: [],
+            previewStreamUrl: rawUrl
+          };
+        }
+
+        if (rawUrl.toLowerCase().includes('.mp4')) {
+          let title = 'Kick_Clip';
+          try {
+            const seg = new URL(rawUrl).pathname.split('/').filter(Boolean).pop();
+            if (seg) title = decodeURIComponent(seg).replace(/\.mp4$/i, '') || title;
+          } catch (_) {}
+          return {
+            m3u8: rawUrl,
+            title,
+            channel: 'direct_mp4',
+            durationSecs: null,
+            durationFormatted: 'Clip',
+            thumbnailUrl: null,
+            publishedAt: null,
+            category: null,
+            views: null,
+            isClip: true,
+            sourceType: 'Direct MP4 URL',
+            variants: [],
+            previewStreamUrl: rawUrl
           };
         }
 
@@ -2092,12 +2594,565 @@
         };
       }
 
+      function destroyTrimPreviewMedia() {
+        if (trimSeekDebounce) {
+          clearTimeout(trimSeekDebounce);
+          trimSeekDebounce = null;
+        }
+        if (trimNudgeTimer) {
+          clearTimeout(trimNudgeTimer);
+          trimNudgeTimer = null;
+        }
+        trimDragging = null;
+        trimHoverFrac = null;
+        trimHoverSecs = null;
+        trimPopoverPinned = false;
+        trimVideoSeeking = false;
+        trimPendingSeekSecs = null;
+        trimLoadedStreamUrl = null;
+        if (trimHlsInstance) {
+          try {
+            trimHlsInstance.destroy();
+          } catch (_) {}
+          trimHlsInstance = null;
+        }
+        if (els.trimPreviewVideo) {
+          try {
+            els.trimPreviewVideo.pause();
+            els.trimPreviewVideo.removeAttribute('src');
+            els.trimPreviewVideo.load();
+          } catch (_) {}
+          els.trimPreviewVideo.classList.remove('ready');
+        }
+        if (els.trimFrameFallback) {
+          els.trimFrameFallback.style.display = 'none';
+          els.trimFrameFallback.removeAttribute('src');
+        }
+        if (els.trimFramePopover) els.trimFramePopover.classList.remove('visible');
+        if (els.trimHoverLine) els.trimHoverLine.classList.remove('visible');
+        if (els.trimHandleStart) els.trimHandleStart.classList.remove('dragging');
+        if (els.trimHandleEnd) els.trimHandleEnd.classList.remove('dragging');
+      }
+
+      function attachHlsPreviewSource(streamUrl, useProxy) {
+        if (!window.Hls || !window.Hls.isSupported() || !els.trimPreviewVideo) return false;
+        if (trimHlsInstance) {
+          try {
+            trimHlsInstance.destroy();
+          } catch (_) {}
+          trimHlsInstance = null;
+        }
+
+        const config = {
+          enableWorker: true,
+          startLevel: 0,
+          autoLevelCapping: 0,
+          maxBufferLength: 6,
+          maxMaxBufferLength: 12,
+          lowLatencyMode: false,
+          autoStartLoad: true
+        };
+
+        if (useProxy) {
+          const BaseLoader = window.Hls.DefaultConfig.loader;
+          class ProxiedHlsLoader extends BaseLoader {
+            load(context, cfg, callbacks) {
+              if (context && context.url && !context.url.startsWith(VIDDASTRAGE_PROXY)) {
+                context.url = VIDDASTRAGE_PROXY + encodeURIComponent(context.url);
+              }
+              super.load(context, cfg, callbacks);
+            }
+          }
+          config.loader = ProxiedHlsLoader;
+        }
+
+        const hls = new window.Hls(config);
+        trimHlsInstance = hls;
+        let retriedWithProxy = useProxy;
+
+        hls.on(window.Hls.Events.ERROR, (_ev, data) => {
+          if (!data || !data.fatal) return;
+          if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR && !retriedWithProxy) {
+            retriedWithProxy = true;
+            attachHlsPreviewSource(streamUrl, true);
+            return;
+          }
+          if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+            try {
+              hls.recoverMediaError();
+            } catch (_) {}
+          }
+        });
+
+        hls.loadSource(streamUrl);
+        hls.attachMedia(els.trimPreviewVideo);
+        return true;
+      }
+
+      function initTrimPreviewMedia(meta) {
+        if (!meta || !els.trimPreviewVideo) return;
+        const streamUrl = meta.previewStreamUrl || meta.m3u8;
+
+        if (els.trimFrameFallback) {
+          if (meta.thumbnailUrl) {
+            els.trimFrameFallback.src = meta.thumbnailUrl;
+            els.trimFrameFallback.style.display = 'block';
+          } else {
+            els.trimFrameFallback.style.display = 'none';
+            els.trimFrameFallback.removeAttribute('src');
+          }
+        }
+
+        if (!streamUrl || streamUrl === trimLoadedStreamUrl) return;
+        if (trimHlsInstance) {
+          try {
+            trimHlsInstance.destroy();
+          } catch (_) {}
+          trimHlsInstance = null;
+        }
+
+        trimLoadedStreamUrl = streamUrl;
+        trimVideoSeeking = false;
+        trimPendingSeekSecs = null;
+        els.trimPreviewVideo.classList.remove('ready');
+
+        const lower = streamUrl.toLowerCase();
+        if (lower.includes('.m3u8')) {
+          if (window.Hls && window.Hls.isSupported()) {
+            attachHlsPreviewSource(streamUrl, false);
+          } else if (els.trimPreviewVideo.canPlayType('application/vnd.apple.mpegurl')) {
+            els.trimPreviewVideo.src = streamUrl;
+            els.trimPreviewVideo.load();
+          }
+        } else {
+          els.trimPreviewVideo.src = streamUrl;
+          els.trimPreviewVideo.load();
+        }
+      }
+
+      function getActiveTrimDuration() {
+        if (vodPreviewState.status !== 'ready') return null;
+        const d = Number(vodPreviewState.meta?.durationSecs);
+        return Number.isFinite(d) && d > 0.5 ? d : null;
+      }
+
+      function resolveTrimBounds(dur) {
+        const minGap = Math.min(0.25, dur * 0.05);
+        const parsedStart = parseHmsToSecs(els.startTime.value);
+        const parsedEnd = parseHmsToSecs(els.endTime.value);
+        let start = parsedStart !== null ? Math.max(0, Math.min(parsedStart, dur - minGap)) : 0;
+        let end = parsedEnd !== null ? Math.max(minGap, Math.min(parsedEnd, dur)) : dur;
+        if (end <= start + minGap) {
+          if (trimActiveHandle === 'start') {
+            start = Math.max(0, end - minGap);
+          } else {
+            end = Math.min(dur, start + minGap);
+          }
+        }
+        const isFull = start <= 0.01 && end >= dur - 0.01;
+        return { start, end, isFull };
+      }
+
+      function applyTrimBounds(startS, endS, dur) {
+        const minGap = Math.min(0.25, dur * 0.05);
+        const clampedStart = Math.max(0, Math.min(startS, dur - minGap));
+        const clampedEnd = Math.max(clampedStart + minGap, Math.min(endS, dur));
+        els.startTime.value = clampedStart <= 0.01 ? '' : formatHmsInput(clampedStart);
+        els.endTime.value = clampedEnd >= dur - 0.01 ? '' : formatHmsInput(clampedEnd);
+        renderVodMetaHead();
+        updateTrimSeekBarUI();
+      }
+
+      function performTrimVideoSeek(secs) {
+        const video = els.trimPreviewVideo;
+        if (!video) return;
+        const dur = getActiveTrimDuration() || (Number.isFinite(video.duration) ? video.duration : null);
+        const safeMax = dur && dur > 0.25 ? dur - 0.15 : secs;
+        const target = Math.max(0, Math.min(secs, safeMax));
+
+        if (video.readyState < 1) {
+          trimPendingSeekSecs = target;
+          return;
+        }
+        trimPendingSeekSecs = null;
+        if (Math.abs((video.currentTime || 0) - target) < 0.04) {
+          if (video.readyState >= 2) {
+            video.classList.add('ready');
+          }
+          return;
+        }
+        try {
+          video.currentTime = target;
+        } catch (_) {}
+      }
+
+      function requestTrimVideoSeek(secs, immediate) {
+        if (trimSeekDebounce) {
+          clearTimeout(trimSeekDebounce);
+          trimSeekDebounce = null;
+        }
+        if (immediate) {
+          performTrimVideoSeek(secs);
+          return;
+        }
+        trimSeekDebounce = setTimeout(() => {
+          trimSeekDebounce = null;
+          performTrimVideoSeek(secs);
+        }, 60);
+      }
+
+      function showTrimPopover(secs, anchorFrac, tagLabel, immediateSeek) {
+        const pop = els.trimFramePopover;
+        const wrap = els.trimTrackWrap;
+        if (!pop || !wrap) return;
+        const trackW = wrap.clientWidth || 1;
+        const popW = pop.offsetWidth || 212;
+        const anchorX = Math.max(0, Math.min(1, anchorFrac)) * trackW;
+        const popLeft = Math.max(0, Math.min(anchorX - popW / 2, Math.max(0, trackW - popW)));
+        const caretX = Math.max(14, Math.min(popW - 14, anchorX - popLeft));
+
+        pop.style.left = popLeft + 'px';
+        if (els.trimFrameCaret) {
+          els.trimFrameCaret.style.left = caretX + 'px';
+        }
+        if (els.trimFrameTs) {
+          els.trimFrameTs.textContent = formatSecsHms(secs);
+        }
+        if (els.trimFrameTag) {
+          els.trimFrameTag.dataset.baseLabel = tagLabel;
+          els.trimFrameTag.textContent = trimVideoSeeking ? 'Loading frame...' : tagLabel;
+          els.trimFrameTag.classList.toggle('loading', trimVideoSeeking);
+        }
+        pop.classList.add('visible');
+        requestTrimVideoSeek(secs, !!immediateSeek);
+      }
+
+      function hideTrimPopover() {
+        if (els.trimFramePopover) els.trimFramePopover.classList.remove('visible');
+        if (els.trimHoverLine) els.trimHoverLine.classList.remove('visible');
+      }
+
+      function pinTrimPopover(secs, anchorFrac, tagLabel) {
+        trimPopoverPinned = true;
+        if (trimNudgeTimer) clearTimeout(trimNudgeTimer);
+        showTrimPopover(secs, anchorFrac, tagLabel, true);
+        trimNudgeTimer = setTimeout(() => {
+          trimNudgeTimer = null;
+          trimPopoverPinned = false;
+          if (!trimDragging && trimHoverFrac === null) {
+            hideTrimPopover();
+          }
+        }, 2000);
+      }
+
+      function updateTrimSeekBarUI() {
+        const dur = getActiveTrimDuration();
+        if (!dur || !els.vodTrimSection) return;
+        const { start, end, isFull } = resolveTrimBounds(dur);
+        const startFrac = Math.max(0, Math.min(1, start / dur));
+        const endFrac = Math.max(startFrac, Math.min(1, end / dur));
+
+        const [sh, sm, ss] = formatTrimHmsParts(start);
+        const [eh, em, es] = formatTrimHmsParts(end);
+        els.trimStartHh.textContent = sh;
+        els.trimStartMm.textContent = sm;
+        els.trimStartSs.textContent = ss;
+        els.trimEndHh.textContent = eh;
+        els.trimEndMm.textContent = em;
+        els.trimEndSs.textContent = es;
+
+        els.trimPillStart.classList.toggle('active', trimActiveHandle === 'start');
+        els.trimPillEnd.classList.toggle('active', trimActiveHandle === 'end');
+        els.trimHandleStart.classList.toggle('active', trimActiveHandle === 'start');
+        els.trimHandleEnd.classList.toggle('active', trimActiveHandle === 'end');
+
+        els.trimSelection.style.left = startFrac * 100 + '%';
+        els.trimSelection.style.width = Math.max(0, (endFrac - startFrac) * 100) + '%';
+        els.trimHandleStart.style.left = startFrac * 100 + '%';
+        els.trimHandleEnd.style.left = endFrac * 100 + '%';
+
+        els.trimPreciseReadout.textContent = `${formatTrimPrecise(start)} → ${formatTrimPrecise(end)}`;
+        els.trimResetBtn.style.opacity = isFull ? '0.55' : '1';
+      }
+
+      function nudgeTrimHandle(deltaSecs) {
+        const dur = getActiveTrimDuration();
+        if (!dur) return;
+        const { start, end } = resolveTrimBounds(dur);
+        const minGap = Math.min(0.25, dur * 0.05);
+        let nextStart = start;
+        let nextEnd = end;
+        if (trimActiveHandle === 'start') {
+          nextStart = Math.max(0, Math.min(start + deltaSecs, end - minGap));
+        } else {
+          nextEnd = Math.max(start + minGap, Math.min(end + deltaSecs, dur));
+        }
+        applyTrimBounds(nextStart, nextEnd, dur);
+        const secs = trimActiveHandle === 'start' ? nextStart : nextEnd;
+        const tag = trimActiveHandle === 'start' ? 'START' : 'END';
+        pinTrimPopover(secs, secs / dur, tag);
+      }
+
+      function handleStartEndInput(which) {
+        if (which === 'start' || which === 'end') {
+          trimActiveHandle = which;
+        }
+        renderVodMetaHead();
+        const dur = getActiveTrimDuration();
+        if (!dur) return;
+        updateTrimSeekBarUI();
+        const { start, end } = resolveTrimBounds(dur);
+        const secs = trimActiveHandle === 'start' ? start : end;
+        const tag = trimActiveHandle === 'start' ? 'START' : 'END';
+        pinTrimPopover(secs, secs / dur, tag);
+      }
+
+      function initTrimControls() {
+        const video = els.trimPreviewVideo;
+        if (video) {
+          video.addEventListener('loadedmetadata', () => {
+            if (
+              vodPreviewState.status === 'ready' &&
+              !vodPreviewState.meta.durationSecs &&
+              Number.isFinite(video.duration) &&
+              video.duration > 0.5
+            ) {
+              vodPreviewState.meta.durationSecs = video.duration;
+              vodPreviewState.meta.durationFormatted = formatSecsHms(video.duration);
+              renderVodPreviewPanel();
+            }
+            if (trimPendingSeekSecs !== null) {
+              performTrimVideoSeek(trimPendingSeekSecs);
+            }
+          });
+          video.addEventListener('seeking', () => {
+            trimVideoSeeking = true;
+            if (els.trimFrameTag) {
+              els.trimFrameTag.textContent = 'Loading frame...';
+              els.trimFrameTag.classList.add('loading');
+            }
+          });
+          const markFrameReady = () => {
+            trimVideoSeeking = false;
+            if (video.readyState >= 2) {
+              video.classList.add('ready');
+            }
+            if (els.trimFrameTag) {
+              els.trimFrameTag.textContent = els.trimFrameTag.dataset.baseLabel || 'SEEK';
+              els.trimFrameTag.classList.remove('loading');
+            }
+          };
+          video.addEventListener('seeked', markFrameReady);
+          video.addEventListener('loadeddata', markFrameReady);
+          video.addEventListener('error', () => {
+            trimVideoSeeking = false;
+            video.classList.remove('ready');
+          });
+        }
+
+        if (els.trimFrameFallback) {
+          els.trimFrameFallback.addEventListener('error', () => {
+            els.trimFrameFallback.style.display = 'none';
+          });
+        }
+
+        const getTrackFrac = (clientX) => {
+          const rect = els.trimTrack.getBoundingClientRect();
+          if (!rect.width) return 0;
+          return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        };
+
+        if (els.trimTrackWrap) {
+          els.trimTrackWrap.addEventListener('pointerdown', (e) => {
+            const dur = getActiveTrimDuration();
+            if (!dur) return;
+            e.preventDefault();
+            const frac = getTrackFrac(e.clientX);
+            const secs = frac * dur;
+            const { start, end } = resolveTrimBounds(dur);
+            const startFrac = start / dur;
+            const endFrac = end / dur;
+
+            let chosen;
+            if (e.target === els.trimHandleStart) {
+              chosen = 'start';
+            } else if (e.target === els.trimHandleEnd) {
+              chosen = 'end';
+            } else {
+              const dStart = Math.abs(frac - startFrac);
+              const dEnd = Math.abs(frac - endFrac);
+              if (Math.abs(dStart - dEnd) < 0.005) {
+                chosen = frac >= startFrac ? 'end' : 'start';
+              } else {
+                chosen = dStart <= dEnd ? 'start' : 'end';
+              }
+            }
+
+            trimDragging = chosen;
+            trimActiveHandle = chosen;
+            trimPopoverPinned = false;
+            if (trimNudgeTimer) {
+              clearTimeout(trimNudgeTimer);
+              trimNudgeTimer = null;
+            }
+            if (els.trimHoverLine) els.trimHoverLine.classList.remove('visible');
+            els.trimHandleStart.classList.toggle('dragging', chosen === 'start');
+            els.trimHandleEnd.classList.toggle('dragging', chosen === 'end');
+
+            try {
+              els.trimTrackWrap.setPointerCapture(e.pointerId);
+            } catch (_) {}
+
+            const minGap = Math.min(0.25, dur * 0.05);
+            let nextStart = start;
+            let nextEnd = end;
+            if (chosen === 'start') {
+              nextStart = Math.max(0, Math.min(secs, end - minGap));
+            } else {
+              nextEnd = Math.max(start + minGap, Math.min(secs, dur));
+            }
+            applyTrimBounds(nextStart, nextEnd, dur);
+            const activeSecs = chosen === 'start' ? nextStart : nextEnd;
+            showTrimPopover(activeSecs, activeSecs / dur, chosen === 'start' ? 'START' : 'END', true);
+          });
+
+          els.trimTrackWrap.addEventListener('pointermove', (e) => {
+            const dur = getActiveTrimDuration();
+            if (!dur) return;
+            const frac = getTrackFrac(e.clientX);
+            const secs = frac * dur;
+            trimHoverFrac = frac;
+            trimHoverSecs = secs;
+
+            if (trimDragging) {
+              const { start, end } = resolveTrimBounds(dur);
+              const minGap = Math.min(0.25, dur * 0.05);
+              let nextStart = start;
+              let nextEnd = end;
+              if (trimDragging === 'start') {
+                nextStart = Math.max(0, Math.min(secs, end - minGap));
+              } else {
+                nextEnd = Math.max(start + minGap, Math.min(secs, dur));
+              }
+              applyTrimBounds(nextStart, nextEnd, dur);
+              const activeSecs = trimDragging === 'start' ? nextStart : nextEnd;
+              showTrimPopover(activeSecs, activeSecs / dur, trimDragging === 'start' ? 'START' : 'END', false);
+              return;
+            }
+
+            if (els.trimHoverLine) {
+              els.trimHoverLine.style.left = frac * 100 + '%';
+              els.trimHoverLine.classList.add('visible');
+            }
+            showTrimPopover(secs, frac, 'SEEK', false);
+          });
+
+          const finishDrag = (e) => {
+            if (!trimDragging) return;
+            const dur = getActiveTrimDuration();
+            const dragged = trimDragging;
+            trimDragging = null;
+            els.trimHandleStart.classList.remove('dragging');
+            els.trimHandleEnd.classList.remove('dragging');
+            try {
+              if (els.trimTrackWrap.hasPointerCapture(e.pointerId)) {
+                els.trimTrackWrap.releasePointerCapture(e.pointerId);
+              }
+            } catch (_) {}
+            if (dur) {
+              const { start, end } = resolveTrimBounds(dur);
+              const secs = dragged === 'start' ? start : end;
+              showTrimPopover(secs, secs / dur, dragged === 'start' ? 'START' : 'END', true);
+            }
+          };
+
+          els.trimTrackWrap.addEventListener('pointerup', finishDrag);
+          els.trimTrackWrap.addEventListener('pointercancel', finishDrag);
+          els.trimTrackWrap.addEventListener('pointerleave', () => {
+            trimHoverFrac = null;
+            trimHoverSecs = null;
+            if (els.trimHoverLine) els.trimHoverLine.classList.remove('visible');
+            if (!trimDragging && !trimPopoverPinned) {
+              hideTrimPopover();
+            }
+          });
+        }
+
+        if (els.trimPillStart) {
+          els.trimPillStart.addEventListener('click', () => {
+            const dur = getActiveTrimDuration();
+            if (!dur) return;
+            trimActiveHandle = 'start';
+            updateTrimSeekBarUI();
+            const { start } = resolveTrimBounds(dur);
+            pinTrimPopover(start, start / dur, 'START');
+          });
+        }
+
+        if (els.trimPillEnd) {
+          els.trimPillEnd.addEventListener('click', () => {
+            const dur = getActiveTrimDuration();
+            if (!dur) return;
+            trimActiveHandle = 'end';
+            updateTrimSeekBarUI();
+            const { end } = resolveTrimBounds(dur);
+            pinTrimPopover(end, end / dur, 'END');
+          });
+        }
+
+        if (els.trimResetBtn) {
+          els.trimResetBtn.addEventListener('click', () => {
+            els.startTime.value = '';
+            els.endTime.value = '';
+            trimActiveHandle = 'start';
+            trimPopoverPinned = false;
+            if (trimNudgeTimer) {
+              clearTimeout(trimNudgeTimer);
+              trimNudgeTimer = null;
+            }
+            hideTrimPopover();
+            renderVodMetaHead();
+            updateTrimSeekBarUI();
+          });
+        }
+
+        if (els.trimNudgeLeft) {
+          els.trimNudgeLeft.addEventListener('click', (e) => {
+            const step = e.altKey ? 0.25 : e.shiftKey ? 10 : 1;
+            nudgeTrimHandle(-step);
+          });
+        }
+
+        if (els.trimNudgeRight) {
+          els.trimNudgeRight.addEventListener('click', (e) => {
+            const step = e.altKey ? 0.25 : e.shiftKey ? 10 : 1;
+            nudgeTrimHandle(step);
+          });
+        }
+
+        document.addEventListener('keydown', (e) => {
+          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+          if (activeTab !== 'downloads') return;
+          const dur = getActiveTrimDuration();
+          if (!dur) return;
+          const activeEl = document.activeElement;
+          const tag = activeEl ? activeEl.tagName.toLowerCase() : '';
+          if (tag === 'input' || tag === 'textarea' || tag === 'select' || activeEl?.isContentEditable) {
+            return;
+          }
+          e.preventDefault();
+          const baseStep = e.altKey ? 0.25 : e.shiftKey ? (dur > 1800 ? 10 : 5) : 1;
+          nudgeTrimHandle(e.key === 'ArrowRight' ? baseStep : -baseStep);
+        });
+      }
+
       function dismissVodPreview() {
         vodPreviewReqId += 1;
         if (vodPreviewDebounce) {
           clearTimeout(vodPreviewDebounce);
           vodPreviewDebounce = null;
         }
+        destroyTrimPreviewMedia();
         vodPreviewState = { status: 'idle' };
         renderVodPreviewPanel();
       }
@@ -2110,6 +3165,7 @@
         }
         vodPreviewReqId += 1;
         const reqId = vodPreviewReqId;
+        destroyTrimPreviewMedia();
         vodPreviewState = { status: 'loading', url: trimmed };
         renderVodPreviewPanel();
 
@@ -2117,11 +3173,19 @@
           const meta = await extractKickVodReal(trimmed);
           if (reqId !== vodPreviewReqId) return;
           if (meta.m3u8 && meta.m3u8.toLowerCase().includes('.m3u8')) {
-            const variants = await probeHlsVariantsWeb(meta.m3u8);
+            const probe = await probeHlsVariantsWeb(meta.m3u8);
             if (reqId !== vodPreviewReqId) return;
-            meta.variants = variants;
+            meta.variants = probe.variants;
+            meta.previewStreamUrl = probe.previewStreamUrl || meta.m3u8;
+            if (!meta.durationSecs && probe.durationSecs) {
+              meta.durationSecs = probe.durationSecs;
+              meta.durationFormatted = formatSecsHms(probe.durationSecs);
+            }
+          } else {
+            meta.previewStreamUrl = meta.m3u8;
           }
           vodPreviewState = { status: 'ready', sourceUrl: trimmed, meta };
+          initTrimPreviewMedia(meta);
           renderVodPreviewPanel();
         } catch (err) {
           if (reqId !== vodPreviewReqId) return;
@@ -2179,17 +3243,12 @@
         return wrap;
       }
 
-      function renderVodPreviewPanel() {
-        const panel = els.vodMetaPanel;
-        if (!panel) return;
-        panel.textContent = '';
+      function renderVodMetaHead() {
+        const head = els.vodMetaHead;
+        if (!head) return;
+        head.textContent = '';
 
-        if (vodPreviewState.status === 'idle') {
-          panel.classList.remove('visible');
-          return;
-        }
-
-        panel.classList.add('visible');
+        if (vodPreviewState.status === 'idle') return;
 
         if (vodPreviewState.status === 'loading') {
           const row = document.createElement('div');
@@ -2216,7 +3275,7 @@
           cancelBtn.addEventListener('click', dismissVodPreview);
 
           row.append(left, cancelBtn);
-          panel.appendChild(row);
+          head.appendChild(row);
           return;
         }
 
@@ -2257,7 +3316,7 @@
 
           actions.append(retryBtn, closeBtn);
           row.append(left, actions);
-          panel.appendChild(row);
+          head.appendChild(row);
           return;
         }
 
@@ -2334,7 +3393,10 @@
           sp.textContent = text;
           metaLine.append(dot, sp);
         };
-        addMetaPart(meta.isClip ? 'Clip' : meta.sourceType === 'Direct M3U8 URL' ? 'HLS' : 'VOD', 'vod-meta-kind');
+        addMetaPart(
+          meta.isClip ? 'Clip' : meta.sourceType === 'Direct M3U8 URL' ? 'HLS' : 'VOD',
+          'vod-meta-kind'
+        );
         if (meta.category) addMetaPart(meta.category, '');
         if (meta.publishedAt) addMetaPart(meta.publishedAt, 'mono');
         if (meta.views) addMetaPart(meta.views.toLocaleString() + ' views', 'mono');
@@ -2383,7 +3445,29 @@
 
         info.append(top, metaLine, streamLine, saveLine);
         body.append(thumbWrap, info);
-        panel.appendChild(body);
+        head.appendChild(body);
+      }
+
+      function renderVodPreviewPanel() {
+        const panel = els.vodMetaPanel;
+        if (!panel) return;
+
+        if (vodPreviewState.status === 'idle') {
+          panel.classList.remove('visible');
+          if (els.vodMetaHead) els.vodMetaHead.textContent = '';
+          if (els.vodTrimSection) els.vodTrimSection.classList.remove('visible');
+          return;
+        }
+
+        panel.classList.add('visible');
+        renderVodMetaHead();
+
+        if (vodPreviewState.status === 'ready' && getActiveTrimDuration()) {
+          if (els.vodTrimSection) els.vodTrimSection.classList.add('visible');
+          updateTrimSeekBarUI();
+        } else if (els.vodTrimSection) {
+          els.vodTrimSection.classList.remove('visible');
+        }
       }
 
       function cancelOngoingDownload() {
@@ -2746,6 +3830,8 @@
             checkForUpdates(true);
           }
         }
+
+        initTrimControls();
       })();
     </script>
   </body>

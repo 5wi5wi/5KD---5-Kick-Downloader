@@ -291,6 +291,13 @@ struct StreamVariantMeta {
 }
 
 #[derive(Clone)]
+struct HlsSegmentEntry {
+    start_secs: f64,
+    duration_secs: f64,
+    url: String,
+}
+
+#[derive(Clone)]
 struct ExtractedVodMeta {
     m3u8_url: String,
     channel_slug: String,
@@ -304,6 +311,19 @@ struct ExtractedVodMeta {
     views: Option<u64>,
     is_clip: bool,
     variants: Vec<StreamVariantMeta>,
+    preview_stream_url: Option<String>,
+    preview_segments: Arc<Vec<HlsSegmentEntry>>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum TrimHandle {
+    Start,
+    End,
+}
+
+struct CachedSeekFrame {
+    bucket_key: u64,
+    texture: egui::TextureHandle,
 }
 
 struct VodPreviewData {
@@ -407,6 +427,16 @@ enum WorkerEvent {
         request_id: u64,
         source_url: String,
         error: String,
+    },
+    SeekFrameReady {
+        preview_request_id: u64,
+        frame_request_id: u64,
+        bucket_key: u64,
+        image: egui::ColorImage,
+    },
+    SeekFrameFailed {
+        preview_request_id: u64,
+        frame_request_id: u64,
     },
     UpdateChecked(Result<Option<UpdateReleaseInfo>, String>),
     UpdateProgress {
@@ -960,9 +990,9 @@ fn looks_like_supported_preview_url(raw: &str) -> bool {
             || lower.contains("/clips/")
             || lower.contains("/clip/")
             || lower.contains("clip="));
-    let is_m3u8 =
-        (lower.starts_with("http://") || lower.starts_with("https://")) && lower.contains(".m3u8");
-    is_kick || is_m3u8
+    let is_direct_media = (lower.starts_with("http://") || lower.starts_with("https://"))
+        && (lower.contains(".m3u8") || lower.contains(".mp4"));
+    is_kick || is_direct_media
 }
 
 fn ytdlp_extract_kick_fallback(
@@ -1042,6 +1072,8 @@ fn ytdlp_extract_kick_fallback(
         views,
         is_clip,
         variants: Vec::new(),
+        preview_stream_url: None,
+        preview_segments: Arc::new(Vec::new()),
     })
 }
 
@@ -1117,6 +1149,8 @@ fn extract_kick_clip(
                 views,
                 is_clip: true,
                 variants: Vec::new(),
+                preview_stream_url: None,
+                preview_segments: Arc::new(Vec::new()),
             });
         }
     }
@@ -1131,28 +1165,41 @@ fn extract_kick_clip(
 /// Full port of https://github.com/mortyobnoxious/kickvod-extractor
 fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<ExtractedVodMeta, String> {
     let trimmed = raw_url.trim();
-    if trimmed.contains(".m3u8") {
+    let lower_trimmed = trimmed.to_ascii_lowercase();
+    if lower_trimmed.contains(".m3u8") || lower_trimmed.contains(".mp4") {
+        let is_mp4 = lower_trimmed.contains(".mp4") && !lower_trimmed.contains(".m3u8");
         let fallback_title = trimmed
             .rsplit('/')
             .next()
             .and_then(|s| s.split(&['?', '#'][..]).next())
-            .and_then(|s| s.strip_suffix(".m3u8"))
+            .and_then(|s| {
+                s.strip_suffix(".m3u8")
+                    .or_else(|| s.strip_suffix(".mp4"))
+                    .or(Some(s))
+            })
             .filter(|s| !s.is_empty() && *s != "master" && *s != "playlist")
-            .unwrap_or("Kick_HLS_Stream")
+            .unwrap_or(if is_mp4 { "Kick_Clip" } else { "Kick_HLS_Stream" })
             .to_string();
         return Ok(ExtractedVodMeta {
             m3u8_url: trimmed.to_string(),
             channel_slug: "kick_stream".to_string(),
             session_title: fallback_title,
-            duration_formatted: "Live/VOD".to_string(),
+            duration_formatted: if is_mp4 { "Clip" } else { "Live/VOD" }.to_string(),
             duration_secs: None,
-            source_type: "Direct M3U8 URL".to_string(),
+            source_type: if is_mp4 {
+                "Direct MP4 URL"
+            } else {
+                "Direct M3U8 URL"
+            }
+            .to_string(),
             thumbnail_url: None,
             published_at: None,
             category: None,
             views: None,
-            is_clip: false,
+            is_clip: is_mp4,
             variants: Vec::new(),
+            preview_stream_url: None,
+            preview_segments: Arc::new(Vec::new()),
         });
     }
 
@@ -1417,6 +1464,8 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
             views,
             is_clip: false,
             variants: Vec::new(),
+            preview_stream_url: None,
+            preview_segments: Arc::new(Vec::new()),
         });
     }
 
@@ -1473,6 +1522,8 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                 views,
                 is_clip: false,
                 variants: Vec::new(),
+                preview_stream_url: None,
+                preview_segments: Arc::new(Vec::new()),
             });
         }
     }
@@ -1499,6 +1550,8 @@ fn extract_kick_vod(raw_url: &str, tx: &Sender<WorkerEvent>) -> Result<Extracted
                     views,
                     is_clip: false,
                     variants: Vec::new(),
+                    preview_stream_url: None,
+                    preview_segments: Arc::new(Vec::new()),
                 });
             }
         }
@@ -1597,6 +1650,51 @@ fn format_secs_hms(secs: f64) -> String {
         (total % 3600) / 60,
         total % 60
     )
+}
+
+fn format_hms_input(secs: f64) -> String {
+    let clamped = secs.max(0.0);
+    let rounded_ms = (clamped * 1000.0).round() as u64;
+    let ms = rounded_ms % 1000;
+    let total_s = rounded_ms / 1000;
+    let h = total_s / 3600;
+    let m = (total_s % 3600) / 60;
+    let s = total_s % 60;
+    if ms < 50 || ms > 950 {
+        let whole = clamped.round() as u64;
+        format!("{:02}:{:02}:{:02}", whole / 3600, (whole % 3600) / 60, whole % 60)
+    } else {
+        format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+    }
+}
+
+fn format_trim_precise(secs: f64) -> String {
+    let clamped = secs.max(0.0);
+    let total_ms = (clamped * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let m = (total_s / 60) % 60;
+    let h = total_s / 3600;
+    if h > 0 {
+        format!("{}:{:02}:{:02}.{:03}", h, m, s, ms)
+    } else {
+        format!("{:02}:{:02}.{:03}", m, s, ms)
+    }
+}
+
+fn format_trim_hms_parts(secs: f64) -> (String, String, String) {
+    let total = secs.max(0.0).floor() as u64;
+    (
+        format!("{:02}", total / 3600),
+        format!("{:02}", (total % 3600) / 60),
+        format!("{:02}", total % 60),
+    )
+}
+
+fn seek_frame_bucket_key(secs: f64, duration: f64) -> u64 {
+    let step = if duration <= 180.0 { 0.5 } else { 1.0 };
+    (secs.max(0.0) / step).round() as u64
 }
 
 fn format_with_commas(n: u64) -> String {
@@ -1828,21 +1926,31 @@ fn probe_hls_stream(m3u8_url: &str, res: Resolution) -> StreamProbeInfo {
     info
 }
 
-fn probe_hls_variants_for_preview(
-    m3u8_url: &str,
-    need_duration: bool,
-) -> (Vec<StreamVariantMeta>, Option<f64>) {
+struct HlsPreviewProbe {
+    variants: Vec<StreamVariantMeta>,
+    duration_secs: Option<f64>,
+    preview_stream_url: Option<String>,
+    preview_segments: Vec<HlsSegmentEntry>,
+}
+
+fn probe_hls_variants_for_preview(m3u8_url: &str) -> HlsPreviewProbe {
+    let mut result = HlsPreviewProbe {
+        variants: Vec::new(),
+        duration_secs: None,
+        preview_stream_url: None,
+        preview_segments: Vec::new(),
+    };
     if !m3u8_url.to_ascii_lowercase().contains(".m3u8") {
-        return (Vec::new(), None);
+        return result;
     }
     let Some(master_text) = fetch_text_with_kick_headers(m3u8_url) else {
-        return (Vec::new(), None);
+        return result;
     };
     if !master_text.contains("#EXTM3U") {
-        return (Vec::new(), None);
+        return result;
     }
 
-    let mut variants: Vec<StreamVariantMeta> = Vec::new();
+    let mut preview_candidate: Option<(u32, u64, String)> = None;
     let mut first_variant_uri: Option<String> = None;
 
     if master_text.contains("#EXT-X-STREAM-INF:") {
@@ -1869,6 +1977,21 @@ fn probe_hls_variants_for_preview(
                     if first_variant_uri.is_none() {
                         first_variant_uri = Some(line.to_string());
                     }
+                    // Pick the lowest-resolution / lowest-bandwidth video variant for ultra-fast scrubbing previews
+                    let sort_h = if height > 0 { height } else { u32::MAX };
+                    let sort_bw = if bandwidth_bps > 0 {
+                        bandwidth_bps
+                    } else {
+                        u64::MAX
+                    };
+                    let is_better_preview = match &preview_candidate {
+                        None => true,
+                        Some((best_h, best_bw, _)) => (sort_h, sort_bw) < (*best_h, *best_bw),
+                    };
+                    if is_better_preview {
+                        preview_candidate = Some((sort_h, sort_bw, line.to_string()));
+                    }
+
                     let fps = fps_attr.or_else(|| infer_fps_from_variant_uri(line));
                     let label = if height > 0 {
                         if let Some(f) = fps.filter(|&f| f >= 48.0) {
@@ -1881,12 +2004,12 @@ fn probe_hls_variants_for_preview(
                     } else {
                         continue;
                     };
-                    if let Some(existing) = variants.iter_mut().find(|v| v.label == label) {
+                    if let Some(existing) = result.variants.iter_mut().find(|v| v.label == label) {
                         if bandwidth_bps > existing.bandwidth_bps {
                             existing.bandwidth_bps = bandwidth_bps;
                         }
                     } else {
-                        variants.push(StreamVariantMeta {
+                        result.variants.push(StreamVariantMeta {
                             label,
                             height,
                             fps,
@@ -1896,7 +2019,7 @@ fn probe_hls_variants_for_preview(
                 }
             }
         }
-        variants.sort_by(|a, b| {
+        result.variants.sort_by(|a, b| {
             b.height
                 .cmp(&a.height)
                 .then_with(|| {
@@ -1909,34 +2032,247 @@ fn probe_hls_variants_for_preview(
         });
     }
 
-    let mut probed_duration: Option<f64> = None;
-    if need_duration {
-        let media_text = if let Some(uri) = first_variant_uri {
-            let media_url = resolve_relative_url(m3u8_url, &uri);
-            fetch_text_with_kick_headers(&media_url).unwrap_or_default()
-        } else {
-            master_text
-        };
-        let mut total_dur = 0.0_f64;
-        let mut segs = 0u64;
-        for line in media_text.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("#EXTINF:") {
-                let num_part = rest.split(',').next().unwrap_or("").trim();
-                if let Ok(sec) = num_part.parse::<f64>() {
-                    if sec.is_finite() && sec > 0.0 {
-                        total_dur += sec;
-                        segs += 1;
-                    }
+    let chosen_uri = preview_candidate
+        .map(|(_, _, u)| u)
+        .or(first_variant_uri);
+    let (media_base_url, media_text) = if let Some(uri) = chosen_uri {
+        let resolved = resolve_relative_url(m3u8_url, &uri);
+        result.preview_stream_url = Some(resolved.clone());
+        let txt = fetch_text_with_kick_headers(&resolved).unwrap_or_default();
+        (resolved, txt)
+    } else {
+        result.preview_stream_url = Some(m3u8_url.to_string());
+        (m3u8_url.to_string(), master_text)
+    };
+
+    let has_complex_hls = media_text.contains("#EXT-X-KEY:")
+        || media_text.contains("#EXT-X-MAP:")
+        || media_text.contains("#EXT-X-BYTERANGE:");
+
+    let mut total_dur = 0.0_f64;
+    let mut segs = 0u64;
+    let mut pending_seg_dur: Option<f64> = None;
+    let mut direct_ts_ok = !has_complex_hls;
+    let mut parsed_segments: Vec<HlsSegmentEntry> = Vec::new();
+
+    for raw_line in media_text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("#EXTINF:") {
+            let num_part = rest.split(',').next().unwrap_or("").trim();
+            if let Ok(sec) = num_part.parse::<f64>() {
+                if sec.is_finite() && sec > 0.0 {
+                    pending_seg_dur = Some(sec);
                 }
             }
-        }
-        if segs > 0 && total_dur > 0.0 {
-            probed_duration = Some(total_dur);
+        } else if !trimmed.starts_with('#') {
+            if let Some(sec) = pending_seg_dur.take() {
+                if direct_ts_ok {
+                    let seg_url = resolve_relative_url(&media_base_url, trimmed);
+                    let path_part = seg_url.split(&['?', '#'][..]).next().unwrap_or(&seg_url);
+                    if path_part.to_ascii_lowercase().ends_with(".ts") {
+                        parsed_segments.push(HlsSegmentEntry {
+                            start_secs: total_dur,
+                            duration_secs: sec,
+                            url: seg_url,
+                        });
+                    } else {
+                        direct_ts_ok = false;
+                        parsed_segments.clear();
+                    }
+                }
+                total_dur += sec;
+                segs += 1;
+            }
         }
     }
 
-    (variants, probed_duration)
+    if segs > 0 && total_dur > 0.0 {
+        result.duration_secs = Some(total_dur);
+    }
+    if direct_ts_ok && !parsed_segments.is_empty() {
+        result.preview_segments = parsed_segments;
+    }
+
+    result
+}
+
+fn kill_process_by_pid(pid: u32) {
+    let pid_str = pid.to_string();
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid_str])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+fn run_ffmpeg_single_frame(
+    input_url: &str,
+    seek_secs: f64,
+    cancel_flag: &AtomicBool,
+    active_pid: &Arc<Mutex<Option<u32>>>,
+) -> Option<egui::ColorImage> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return None;
+    }
+    let seek_arg = format!("{:.3}", seek_secs.max(0.0));
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-user_agent",
+        CHROME_UA,
+        "-headers",
+        "Origin: https://kick.com\r\nReferer: https://kick.com/\r\n",
+        "-ss",
+        &seek_arg,
+        "-i",
+        input_url,
+        "-an",
+        "-sn",
+        "-dn",
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=320:180:force_original_aspect_ratio=decrease",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-q:v",
+        "6",
+        "pipe:1",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = cmd.spawn().ok()?;
+    let pid = child.id();
+    if let Ok(mut guard) = active_pid.lock() {
+        *guard = Some(pid);
+    }
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Ok(mut guard) = active_pid.lock() {
+            if *guard == Some(pid) {
+                *guard = None;
+            }
+        }
+        return None;
+    }
+
+    let mut jpeg_bytes: Vec<u8> = Vec::with_capacity(24 * 1024);
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 || cancel_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            if jpeg_bytes.len() + n <= 4 * 1024 * 1024 {
+                jpeg_bytes.extend_from_slice(&buf[..n]);
+            } else {
+                break;
+            }
+        }
+    }
+
+    if cancel_flag.load(Ordering::SeqCst) {
+        let _ = child.kill();
+    }
+    let status = child.wait().ok();
+    if let Ok(mut guard) = active_pid.lock() {
+        if *guard == Some(pid) {
+            *guard = None;
+        }
+    }
+
+    if cancel_flag.load(Ordering::SeqCst) || jpeg_bytes.is_empty() {
+        return None;
+    }
+    if let Some(st) = status {
+        if !st.success() && jpeg_bytes.len() < 256 {
+            return None;
+        }
+    }
+
+    let decoded = image::load_from_memory(&jpeg_bytes).ok()?;
+    let resized = decoded
+        .resize_to_fill(320, 180, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [resized.width() as usize, resized.height() as usize],
+        resized.as_raw(),
+    ))
+}
+
+fn fetch_seek_preview_frame(
+    m3u8_url: &str,
+    preview_stream_url: Option<&str>,
+    preview_segments: &[HlsSegmentEntry],
+    duration_secs: Option<f64>,
+    target_secs: f64,
+    cancel_flag: &AtomicBool,
+    active_pid: &Arc<Mutex<Option<u32>>>,
+) -> Option<egui::ColorImage> {
+    let clamped = match duration_secs {
+        Some(d) if d > 0.6 => target_secs.clamp(0.0, d - 0.5),
+        _ => target_secs.max(0.0),
+    };
+
+    // Fast path: direct single MPEG-TS segment lookup (avoids re-downloading multi-hour playlists)
+    if !preview_segments.is_empty() {
+        let idx = preview_segments
+            .partition_point(|s| s.start_secs <= clamped)
+            .saturating_sub(1);
+        if let Some(seg) = preview_segments.get(idx) {
+            let local_offset = (clamped - seg.start_secs)
+                .max(0.0)
+                .min((seg.duration_secs - 0.1).max(0.0));
+            if let Some(img) = run_ffmpeg_single_frame(&seg.url, local_offset, cancel_flag, active_pid)
+            {
+                return Some(img);
+            }
+            if cancel_flag.load(Ordering::SeqCst) {
+                return None;
+            }
+        }
+    }
+
+    let primary_url = preview_stream_url.unwrap_or(m3u8_url);
+    if let Some(img) = run_ffmpeg_single_frame(primary_url, clamped, cancel_flag, active_pid) {
+        return Some(img);
+    }
+    if cancel_flag.load(Ordering::SeqCst) {
+        return None;
+    }
+
+    if primary_url != m3u8_url {
+        return run_ffmpeg_single_frame(m3u8_url, clamped, cancel_flag, active_pid);
+    }
+    None
 }
 
 fn fetch_thumbnail_color_image(url: &str) -> Option<egui::ColorImage> {
@@ -3146,6 +3482,18 @@ struct FiveKdApp {
     last_observed_url: String,
     pending_preview_url: Option<(String, Instant)>,
 
+    trim_active_handle: TrimHandle,
+    trim_dragging: Option<TrimHandle>,
+    trim_preview_target_secs: Option<f64>,
+    trim_preview_until: Option<Instant>,
+    trim_frame_req_id: u64,
+    trim_frame_pending: Option<(f64, Instant)>,
+    trim_frame_loading: bool,
+    trim_frame_cancel: Arc<AtomicBool>,
+    trim_frame_pid: Arc<Mutex<Option<u32>>>,
+    trim_frame_cache: VecDeque<CachedSeekFrame>,
+    trim_last_displayed_frame: Option<egui::TextureHandle>,
+
     check_updates_on_launch: bool,
     github_repo: String,
     update_state: UpdateState,
@@ -3254,6 +3602,17 @@ impl FiveKdApp {
             preview_request_id: 0,
             last_observed_url: String::new(),
             pending_preview_url: None,
+            trim_active_handle: TrimHandle::Start,
+            trim_dragging: None,
+            trim_preview_target_secs: None,
+            trim_preview_until: None,
+            trim_frame_req_id: 0,
+            trim_frame_pending: None,
+            trim_frame_loading: false,
+            trim_frame_cancel: Arc::new(AtomicBool::new(false)),
+            trim_frame_pid: Arc::new(Mutex::new(None)),
+            trim_frame_cache: VecDeque::with_capacity(64),
+            trim_last_displayed_frame: None,
             check_updates_on_launch: cfg.check_updates_on_launch,
             github_repo: effective_repo,
             update_state: UpdateState::Idle,
@@ -3422,10 +3781,182 @@ impl FiveKdApp {
         }
     }
 
+    fn cancel_inflight_seek_frame(&mut self) {
+        self.trim_frame_cancel.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.trim_frame_pid.lock() {
+            if let Some(pid) = guard.take() {
+                kill_process_by_pid(pid);
+            }
+        }
+        self.trim_frame_cancel = Arc::new(AtomicBool::new(false));
+        self.trim_frame_pid = Arc::new(Mutex::new(None));
+        self.trim_frame_loading = false;
+    }
+
+    fn reset_trim_preview_state(&mut self) {
+        self.trim_frame_req_id = self.trim_frame_req_id.wrapping_add(1);
+        self.cancel_inflight_seek_frame();
+        self.trim_active_handle = TrimHandle::Start;
+        self.trim_dragging = None;
+        self.trim_preview_target_secs = None;
+        self.trim_preview_until = None;
+        self.trim_frame_pending = None;
+        self.trim_frame_cache.clear();
+        self.trim_last_displayed_frame = None;
+    }
+
+    fn resolve_trim_bounds(&self, duration: f64) -> (f64, f64) {
+        let dur = duration.max(0.1);
+        let min_gap = if dur > 2.0 { 1.0 } else { (dur * 0.1).max(0.1) };
+        let start_s = parse_hms_to_secs(&self.start_time)
+            .unwrap_or(0.0)
+            .clamp(0.0, (dur - min_gap).max(0.0));
+        let end_s = parse_hms_to_secs(&self.end_time)
+            .unwrap_or(dur)
+            .clamp((start_s + min_gap).min(dur), dur);
+        (start_s, end_s)
+    }
+
+    fn apply_trim_bounds(&mut self, start_secs: f64, end_secs: f64, duration: f64) {
+        let dur = duration.max(0.1);
+        let min_gap = if dur > 2.0 { 1.0 } else { (dur * 0.1).max(0.1) };
+        let s = start_secs.clamp(0.0, (dur - min_gap).max(0.0));
+        let e = end_secs.clamp((s + min_gap).min(dur), dur);
+
+        if s <= 0.05 {
+            self.start_time.clear();
+        } else {
+            self.start_time = format_hms_input(s);
+        }
+
+        if (dur - e) <= 0.05 {
+            self.end_time.clear();
+        } else {
+            self.end_time = format_hms_input(e);
+        }
+    }
+
+    fn nudge_trim_handle(&mut self, delta_secs: f64, duration: f64, ctx: &egui::Context) {
+        let dur = duration.max(0.1);
+        let min_gap = if dur > 2.0 { 1.0 } else { (dur * 0.1).max(0.1) };
+        let (mut start_s, mut end_s) = self.resolve_trim_bounds(dur);
+        let target_s = match self.trim_active_handle {
+            TrimHandle::Start => {
+                start_s = (start_s + delta_secs).clamp(0.0, (end_s - min_gap).max(0.0));
+                start_s
+            }
+            TrimHandle::End => {
+                end_s = (end_s + delta_secs).clamp((start_s + min_gap).min(dur), dur);
+                end_s
+            }
+        };
+        self.apply_trim_bounds(start_s, end_s, dur);
+        self.trim_preview_target_secs = Some(target_s);
+        self.trim_preview_until = Some(Instant::now() + Duration::from_millis(2000));
+        self.schedule_seek_frame_preview(target_s, dur, false, ctx);
+        ctx.request_repaint_after(Duration::from_millis(2050));
+    }
+
+    fn lookup_cached_frame(&self, target_secs: f64, duration: f64) -> Option<egui::TextureHandle> {
+        let bucket = seek_frame_bucket_key(target_secs, duration);
+        self.trim_frame_cache
+            .iter()
+            .find(|c| c.bucket_key == bucket)
+            .map(|c| c.texture.clone())
+    }
+
+    fn schedule_seek_frame_preview(
+        &mut self,
+        target_secs: f64,
+        duration: f64,
+        immediate: bool,
+        ctx: &egui::Context,
+    ) {
+        self.trim_preview_target_secs = Some(target_secs);
+        if let Some(tex) = self.lookup_cached_frame(target_secs, duration) {
+            self.trim_last_displayed_frame = Some(tex);
+            self.trim_frame_pending = None;
+            self.trim_frame_loading = false;
+            return;
+        }
+        if immediate {
+            self.spawn_seek_frame_fetch(target_secs, duration);
+        } else {
+            self.trim_frame_pending = Some((target_secs, Instant::now()));
+            ctx.request_repaint_after(Duration::from_millis(145));
+        }
+    }
+
+    fn spawn_seek_frame_fetch(&mut self, target_secs: f64, duration: f64) {
+        let (m3u8_url, preview_stream_url, preview_segments, duration_secs) =
+            match &self.preview_state {
+                VodPreviewState::Ready(data) => (
+                    data.meta.m3u8_url.clone(),
+                    data.meta.preview_stream_url.clone(),
+                    Arc::clone(&data.meta.preview_segments),
+                    data.meta.duration_secs.or(Some(duration)),
+                ),
+                _ => return,
+            };
+
+        let bucket_key = seek_frame_bucket_key(target_secs, duration);
+        if let Some(tex) = self.lookup_cached_frame(target_secs, duration) {
+            self.trim_last_displayed_frame = Some(tex);
+            self.trim_frame_pending = None;
+            self.trim_frame_loading = false;
+            return;
+        }
+
+        self.cancel_inflight_seek_frame();
+        self.trim_frame_req_id = self.trim_frame_req_id.wrapping_add(1);
+        let frame_req_id = self.trim_frame_req_id;
+        let preview_req_id = self.preview_request_id;
+        self.trim_frame_pending = None;
+        self.trim_frame_loading = true;
+
+        let cancel_flag = Arc::clone(&self.trim_frame_cancel);
+        let pid_slot = Arc::clone(&self.trim_frame_pid);
+        let tx = self.tx.clone();
+        let notifier = self.notifier.clone();
+
+        thread::spawn(move || {
+            let img = fetch_seek_preview_frame(
+                &m3u8_url,
+                preview_stream_url.as_deref(),
+                &preview_segments,
+                duration_secs,
+                target_secs,
+                &cancel_flag,
+                &pid_slot,
+            );
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            match img {
+                Some(image) => {
+                    let _ = tx.send(WorkerEvent::SeekFrameReady {
+                        preview_request_id: preview_req_id,
+                        frame_request_id: frame_req_id,
+                        bucket_key,
+                        image,
+                    });
+                }
+                None => {
+                    let _ = tx.send(WorkerEvent::SeekFrameFailed {
+                        preview_request_id: preview_req_id,
+                        frame_request_id: frame_req_id,
+                    });
+                }
+            }
+            notifier.wake_immediate();
+        });
+    }
+
     fn dismiss_vod_preview(&mut self) {
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         self.pending_preview_url = None;
         self.preview_state = VodPreviewState::Idle;
+        self.reset_trim_preview_state();
     }
 
     fn trigger_vod_preview(&mut self, raw_url: String) {
@@ -3437,6 +3968,7 @@ impl FiveKdApp {
         self.preview_request_id = self.preview_request_id.wrapping_add(1);
         let req_id = self.preview_request_id;
         self.pending_preview_url = None;
+        self.reset_trim_preview_state();
         self.preview_state = VodPreviewState::Loading {
             url: trimmed.clone(),
         };
@@ -3446,15 +3978,19 @@ impl FiveKdApp {
         thread::spawn(move || {
             match extract_kick_vod(&trimmed, &tx) {
                 Ok(mut meta) => {
-                    let (variants, probed_dur) = probe_hls_variants_for_preview(
-                        &meta.m3u8_url,
-                        meta.duration_secs.is_none(),
-                    );
-                    if !variants.is_empty() {
-                        meta.variants = variants;
+                    let probe = probe_hls_variants_for_preview(&meta.m3u8_url);
+                    if !probe.variants.is_empty() {
+                        meta.variants = probe.variants;
+                    }
+                    meta.preview_stream_url = probe.preview_stream_url;
+                    if !probe.preview_segments.is_empty() {
+                        meta.preview_segments = Arc::new(probe.preview_segments);
                     }
                     if meta.duration_secs.is_none() {
-                        if let Some(d) = probed_dur {
+                        let fallback_dur = probe
+                            .duration_secs
+                            .or_else(|| probe_with_ffprobe(&meta.m3u8_url).duration_secs);
+                        if let Some(d) = fallback_dur {
                             meta.duration_secs = Some(d);
                             meta.duration_formatted = format_secs_hms(d);
                         }
@@ -3858,6 +4394,48 @@ impl FiveKdApp {
                         };
                     }
                 }
+                WorkerEvent::SeekFrameReady {
+                    preview_request_id,
+                    frame_request_id,
+                    bucket_key,
+                    image,
+                } => {
+                    if preview_request_id == self.preview_request_id {
+                        let tex = ctx.load_texture(
+                            format!("seek_frame_{}_{}", preview_request_id, bucket_key),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        if let Some(pos) = self
+                            .trim_frame_cache
+                            .iter()
+                            .position(|c| c.bucket_key == bucket_key)
+                        {
+                            self.trim_frame_cache.remove(pos);
+                        }
+                        if self.trim_frame_cache.len() >= 64 {
+                            self.trim_frame_cache.pop_front();
+                        }
+                        self.trim_frame_cache.push_back(CachedSeekFrame {
+                            bucket_key,
+                            texture: tex.clone(),
+                        });
+                        if frame_request_id == self.trim_frame_req_id {
+                            self.trim_last_displayed_frame = Some(tex);
+                            self.trim_frame_loading = false;
+                        }
+                    }
+                }
+                WorkerEvent::SeekFrameFailed {
+                    preview_request_id,
+                    frame_request_id,
+                } => {
+                    if preview_request_id == self.preview_request_id
+                        && frame_request_id == self.trim_frame_req_id
+                    {
+                        self.trim_frame_loading = false;
+                    }
+                }
                 WorkerEvent::UpdateChecked(result) => match result {
                     Ok(Some(info)) => {
                         self.update_state = UpdateState::Available(info);
@@ -3901,12 +4479,33 @@ impl FiveKdApp {
             Refresh(String),
         }
 
+        enum PreviewSnapshot {
+            Loading(String),
+            Error(String, String),
+            Ready {
+                source_url: String,
+                meta: ExtractedVodMeta,
+                thumb_id: Option<egui::TextureId>,
+            },
+        }
+
+        let snapshot = match &self.preview_state {
+            VodPreviewState::Idle => return,
+            VodPreviewState::Loading { url } => PreviewSnapshot::Loading(url.clone()),
+            VodPreviewState::Error { url, message } => {
+                PreviewSnapshot::Error(url.clone(), message.clone())
+            }
+            VodPreviewState::Ready(data) => PreviewSnapshot::Ready {
+                source_url: data.source_url.clone(),
+                meta: data.meta.clone(),
+                thumb_id: data.thumbnail.as_ref().map(|t| t.id()),
+            },
+        };
+
         let mut action = PanelAction::None;
 
-        match &self.preview_state {
-            VodPreviewState::Idle => return,
-            VodPreviewState::Loading { url } => {
-                let url_display = url.clone();
+        match snapshot {
+            PreviewSnapshot::Loading(url_display) => {
                 egui::Frame::none()
                     .fill(BG_SURFACE)
                     .rounding(Rounding::same(10.0))
@@ -3957,9 +4556,7 @@ impl FiveKdApp {
                         });
                     });
             }
-            VodPreviewState::Error { url, message } => {
-                let retry_url = url.clone();
-                let err_msg = message.clone();
+            PreviewSnapshot::Error(retry_url, err_msg) => {
                 egui::Frame::none()
                     .fill(BG_SURFACE)
                     .rounding(Rounding::same(10.0))
@@ -4019,16 +4616,18 @@ impl FiveKdApp {
                         });
                     });
             }
-            VodPreviewState::Ready(data) => {
-                let meta = &data.meta;
-                let source_url = data.source_url.clone();
+            PreviewSnapshot::Ready {
+                source_url,
+                meta,
+                thumb_id,
+            } => {
                 let (effective_secs, is_sliced) = compute_effective_slice_secs(
                     meta.duration_secs,
                     &self.start_time,
                     &self.end_time,
                 );
                 let est_bytes = estimate_download_size_bytes(
-                    meta,
+                    &meta,
                     self.resolution,
                     &self.start_time,
                     &self.end_time,
@@ -4056,9 +4655,9 @@ impl FiveKdApp {
 
                             // 16:9 Thumbnail Preview (with clean fallback and duration stamp)
                             let thumb_size = Vec2::new(160.0, 90.0);
-                            let thumb_rect = if let Some(tex) = &data.thumbnail {
+                            let thumb_rect = if let Some(tid) = thumb_id {
                                 let resp = ui.add(
-                                    egui::Image::from_texture((tex.id(), thumb_size))
+                                    egui::Image::from_texture((tid, thumb_size))
                                         .rounding(Rounding::same(6.0)),
                                 );
                                 ui.painter().rect_stroke(
@@ -4310,6 +4909,12 @@ impl FiveKdApp {
                                 },
                             );
                         });
+
+                        // Interactive Trim Seek Bar + Frame Preview Popover
+                        if let Some(dur) = meta.duration_secs.filter(|&d| d.is_finite() && d > 0.5)
+                        {
+                            self.render_trim_seek_bar(ui, dur, thumb_id);
+                        }
                     });
             }
         }
@@ -4321,6 +4926,546 @@ impl FiveKdApp {
         }
 
         ui.add_space(12.0);
+    }
+
+    fn render_trim_seek_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        duration: f64,
+        fallback_thumb: Option<egui::TextureId>,
+    ) {
+        let dur = duration.max(0.5);
+        let min_gap = if dur > 2.0 { 1.0 } else { (dur * 0.1).max(0.1) };
+        let (mut start_s, mut end_s) = self.resolve_trim_bounds(dur);
+
+        // Subtle horizontal hairline divider
+        ui.add_space(10.0);
+        let (div_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().hline(
+            div_rect.x_range(),
+            div_rect.center().y,
+            Stroke::new(1.0, BORDER_SUBTLE),
+        );
+        ui.add_space(10.0);
+
+        // Keyboard ArrowLeft / ArrowRight precision nudging when no text input has focus
+        if !ui.ctx().wants_keyboard_input() {
+            let (left_pressed, right_pressed, shift, alt) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.shift,
+                    i.modifiers.alt,
+                )
+            });
+            if left_pressed || right_pressed {
+                let base_step = if alt {
+                    0.25
+                } else if shift {
+                    if dur < 120.0 { 5.0 } else { 10.0 }
+                } else if dur < 60.0 {
+                    0.5
+                } else {
+                    1.0
+                };
+                let delta = if left_pressed { -base_step } else { base_step };
+                self.nudge_trim_handle(delta, dur, ui.ctx());
+                let updated = self.resolve_trim_bounds(dur);
+                start_s = updated.0;
+                end_s = updated.1;
+            }
+        }
+
+        // Row 1: "Trim" header on left, linked Start -> End timecode boxes on right
+        let mut clicked_pill: Option<TrimHandle> = None;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Trim")
+                    .size(14.5)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let draw_time_pill = |ui: &mut egui::Ui, secs: f64, is_active: bool| -> egui::Response {
+                    let (hh, mm, ss) = format_trim_hms_parts(secs);
+                    let border = if is_active { ACCENT_GREEN } else { BORDER_SUBTLE };
+                    let frame_resp = egui::Frame::none()
+                        .fill(BG_ELEVATED)
+                        .rounding(Rounding::same(8.0))
+                        .stroke(Stroke::new(1.0, border))
+                        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                ui.label(
+                                    RichText::new(hh)
+                                        .size(12.5)
+                                        .family(FontFamily::Monospace)
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.label(
+                                    RichText::new(":")
+                                        .size(12.0)
+                                        .family(FontFamily::Monospace)
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.label(
+                                    RichText::new(mm)
+                                        .size(12.5)
+                                        .family(FontFamily::Monospace)
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.label(
+                                    RichText::new(":")
+                                        .size(12.0)
+                                        .family(FontFamily::Monospace)
+                                        .color(TEXT_MUTED),
+                                );
+                                ui.label(
+                                    RichText::new(ss)
+                                        .size(12.5)
+                                        .family(FontFamily::Monospace)
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                );
+                            });
+                        })
+                        .response
+                        .interact(Sense::click());
+                    if frame_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    frame_resp
+                };
+
+                if draw_time_pill(ui, end_s, self.trim_active_handle == TrimHandle::End)
+                    .on_hover_text("Select End handle (use ← → to nudge)")
+                    .clicked()
+                {
+                    clicked_pill = Some(TrimHandle::End);
+                }
+
+                ui.label(RichText::new("→").size(13.0).color(TEXT_MUTED));
+
+                if draw_time_pill(ui, start_s, self.trim_active_handle == TrimHandle::Start)
+                    .on_hover_text("Select Start handle (use ← → to nudge)")
+                    .clicked()
+                {
+                    clicked_pill = Some(TrimHandle::Start);
+                }
+            });
+        });
+
+        if let Some(handle) = clicked_pill {
+            self.trim_active_handle = handle;
+            let t = if handle == TrimHandle::Start { start_s } else { end_s };
+            self.trim_preview_until = Some(Instant::now() + Duration::from_millis(2200));
+            self.schedule_seek_frame_preview(t, dur, true, ui.ctx());
+            ui.ctx().request_repaint_after(Duration::from_millis(2250));
+        }
+
+        ui.add_space(10.0);
+
+        // Row 2: Dual-handle green range seek track
+        let track_total_h = 26.0;
+        let track_bar_h = 16.0;
+        let handle_r = 10.5_f32;
+        let (bar_rect, bar_resp) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), track_total_h),
+            Sense::click_and_drag(),
+        );
+
+        let cy = bar_rect.center().y;
+        let usable_left = bar_rect.left() + handle_r;
+        let usable_right = (bar_rect.right() - handle_r).max(usable_left + 1.0);
+        let usable_w = usable_right - usable_left;
+
+        let secs_to_x = |s: f64| -> f32 {
+            let frac = (s / dur).clamp(0.0, 1.0) as f32;
+            usable_left + frac * usable_w
+        };
+        let x_to_secs = |x: f32| -> f64 {
+            let frac = ((x - usable_left) / usable_w).clamp(0.0, 1.0) as f64;
+            frac * dur
+        };
+
+        let mut hover_preview: Option<(f64, f32)> = None;
+
+        // Pointer drag / click interaction
+        if bar_resp.drag_started() || (bar_resp.clicked() && self.trim_dragging.is_none()) {
+            if let Some(pos) = bar_resp.interact_pointer_pos() {
+                let start_x = secs_to_x(start_s);
+                let end_x = secs_to_x(end_s);
+                let dist_start = (pos.x - start_x).abs();
+                let dist_end = (pos.x - end_x).abs();
+                let chosen = if dist_start <= dist_end {
+                    TrimHandle::Start
+                } else {
+                    TrimHandle::End
+                };
+                self.trim_active_handle = chosen;
+                let target_s = x_to_secs(pos.x);
+                match chosen {
+                    TrimHandle::Start => {
+                        start_s = target_s.clamp(0.0, (end_s - min_gap).max(0.0));
+                    }
+                    TrimHandle::End => {
+                        end_s = target_s.clamp((start_s + min_gap).min(dur), dur);
+                    }
+                }
+                self.apply_trim_bounds(start_s, end_s, dur);
+                let landed = if chosen == TrimHandle::Start { start_s } else { end_s };
+                if bar_resp.drag_started() {
+                    self.trim_dragging = Some(chosen);
+                    self.schedule_seek_frame_preview(landed, dur, false, ui.ctx());
+                } else {
+                    self.trim_preview_until = Some(Instant::now() + Duration::from_millis(2000));
+                    self.schedule_seek_frame_preview(landed, dur, true, ui.ctx());
+                    ui.ctx().request_repaint_after(Duration::from_millis(2050));
+                }
+            }
+        } else if bar_resp.dragged() {
+            if let (Some(handle), Some(pos)) = (self.trim_dragging, bar_resp.interact_pointer_pos()) {
+                let target_s = x_to_secs(pos.x);
+                match handle {
+                    TrimHandle::Start => {
+                        start_s = target_s.clamp(0.0, (end_s - min_gap).max(0.0));
+                    }
+                    TrimHandle::End => {
+                        end_s = target_s.clamp((start_s + min_gap).min(dur), dur);
+                    }
+                }
+                self.apply_trim_bounds(start_s, end_s, dur);
+                let landed = if handle == TrimHandle::Start { start_s } else { end_s };
+                self.schedule_seek_frame_preview(landed, dur, false, ui.ctx());
+            }
+        }
+
+        if bar_resp.drag_stopped() {
+            if let Some(handle) = self.trim_dragging.take() {
+                let landed = if handle == TrimHandle::Start { start_s } else { end_s };
+                self.trim_preview_until = Some(Instant::now() + Duration::from_millis(1200));
+                self.schedule_seek_frame_preview(landed, dur, true, ui.ctx());
+                ui.ctx().request_repaint_after(Duration::from_millis(1250));
+            }
+        }
+
+        if self.trim_dragging.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if bar_resp.hovered() {
+            if let Some(pos) = bar_resp.hover_pos() {
+                let sx = secs_to_x(start_s);
+                let ex = secs_to_x(end_s);
+                if (pos.x - sx).abs() <= handle_r + 6.0 || (pos.x - ex).abs() <= handle_r + 6.0 {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                } else {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let hover_s = x_to_secs(pos.x);
+                hover_preview = Some((hover_s, pos.x.clamp(usable_left, usable_right)));
+                let prev_bucket = self
+                    .trim_preview_target_secs
+                    .map(|p| seek_frame_bucket_key(p, dur));
+                let cur_bucket = seek_frame_bucket_key(hover_s, dur);
+                if prev_bucket != Some(cur_bucket) {
+                    self.schedule_seek_frame_preview(hover_s, dur, false, ui.ctx());
+                } else {
+                    self.trim_preview_target_secs = Some(hover_s);
+                }
+            }
+        }
+
+        // Paint seek track + selected green range + handles
+        let painter = ui.painter();
+        let pill_rect = Rect::from_min_max(
+            Pos2::new(bar_rect.left(), cy - track_bar_h * 0.5),
+            Pos2::new(bar_rect.right(), cy + track_bar_h * 0.5),
+        );
+        painter.rect_filled(pill_rect, Rounding::same(track_bar_h * 0.5), Color32::from_rgb(42, 46, 52));
+        painter.rect_stroke(pill_rect, Rounding::same(track_bar_h * 0.5), Stroke::new(1.0, BORDER_HOVER));
+
+        let start_x = secs_to_x(start_s);
+        let end_x = secs_to_x(end_s);
+        let sel_rect = Rect::from_min_max(
+            Pos2::new((start_x - handle_r).max(bar_rect.left()), cy - track_bar_h * 0.5),
+            Pos2::new((end_x + handle_r).min(bar_rect.right()), cy + track_bar_h * 0.5),
+        );
+        painter.rect_filled(sel_rect, Rounding::same(track_bar_h * 0.5), ACCENT_GREEN);
+
+        // Hover hairline cursor when scrubbing over track without dragging
+        if self.trim_dragging.is_none() {
+            if let Some((_, hx)) = hover_preview {
+                painter.vline(
+                    hx,
+                    egui::Rangef::new(cy - track_bar_h * 0.5 + 1.0, cy + track_bar_h * 0.5 - 1.0),
+                    Stroke::new(1.5, Color32::from_rgba_unmultiplied(244, 246, 248, 200)),
+                );
+            }
+        }
+
+        // Draw Start and End circular handles
+        for (handle, hx) in [(TrimHandle::Start, start_x), (TrimHandle::End, end_x)] {
+            let center = Pos2::new(hx, cy);
+            let is_active = self.trim_active_handle == handle;
+            let is_dragged = self.trim_dragging == Some(handle);
+            let outer_r = if is_dragged { handle_r + 1.0 } else { handle_r };
+
+            // Outer dark outline separates handle cleanly against the green range bar
+            painter.circle_filled(center, outer_r, Color32::from_rgb(8, 10, 12));
+            if is_active {
+                painter.circle_stroke(
+                    center,
+                    outer_r + 0.75,
+                    Stroke::new(1.25, Color32::from_rgba_unmultiplied(244, 246, 248, 140)),
+                );
+            }
+            // Thick bright green ring + pure black core (matching reference screenshot)
+            painter.circle_filled(center, outer_r - 1.6, ACCENT_GREEN);
+            painter.circle_filled(center, outer_r - 4.6, Color32::BLACK);
+        }
+
+        ui.add_space(6.0);
+
+        // Row 3: Precise timestamps + "Reset selection" on left, "Use [<-] [->] keys for more precision" on right
+        let mut do_reset = false;
+        let mut nudge_click: Option<f64> = None;
+        let click_step = if dur < 60.0 { 0.5 } else { 1.0 };
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(
+                RichText::new(format!(
+                    "{} → {}",
+                    format_trim_precise(start_s),
+                    format_trim_precise(end_s)
+                ))
+                .size(12.0)
+                .family(FontFamily::Monospace)
+                .color(TEXT_MUTED),
+            );
+
+            ui.add_space(4.0);
+            let reset_resp = ui.add(
+                egui::Label::new(
+                    RichText::new("Reset selection")
+                        .size(12.0)
+                        .strong()
+                        .color(ACCENT_GREEN),
+                )
+                .sense(Sense::click()),
+            );
+            if reset_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if reset_resp.clicked() {
+                do_reset = true;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                ui.label(
+                    RichText::new("keys for more precision")
+                        .size(11.5)
+                        .color(TEXT_MUTED),
+                );
+
+                let right_key = egui::Button::new(
+                    RichText::new("→")
+                        .size(11.5)
+                        .family(FontFamily::Monospace)
+                        .color(TEXT_PRIMARY),
+                )
+                .fill(BG_ELEVATED)
+                .stroke(Stroke::new(1.0, BORDER_HOVER))
+                .rounding(Rounding::same(5.0))
+                .min_size(Vec2::new(24.0, 20.0));
+                if ui
+                    .add(right_key)
+                    .on_hover_text("Nudge active handle forward (+1s)")
+                    .clicked()
+                {
+                    nudge_click = Some(click_step);
+                }
+
+                let left_key = egui::Button::new(
+                    RichText::new("←")
+                        .size(11.5)
+                        .family(FontFamily::Monospace)
+                        .color(TEXT_PRIMARY),
+                )
+                .fill(BG_ELEVATED)
+                .stroke(Stroke::new(1.0, BORDER_HOVER))
+                .rounding(Rounding::same(5.0))
+                .min_size(Vec2::new(24.0, 20.0));
+                if ui
+                    .add(left_key)
+                    .on_hover_text("Nudge active handle backward (-1s)")
+                    .clicked()
+                {
+                    nudge_click = Some(-click_step);
+                }
+
+                ui.label(RichText::new("Use").size(11.5).color(TEXT_MUTED));
+            });
+        });
+
+        if do_reset {
+            self.start_time.clear();
+            self.end_time.clear();
+            self.trim_dragging = None;
+            self.trim_preview_until = None;
+        }
+        if let Some(delta) = nudge_click {
+            self.nudge_trim_handle(delta, dur, ui.ctx());
+        }
+
+        // Determine whether floating 16:9 frame preview popover should be visible
+        let nudge_active = self
+            .trim_preview_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false);
+
+        let popover_info: Option<(f64, f32, &str)> = if let Some(handle) = self.trim_dragging {
+            let (ts, anchor_x, tag) = if handle == TrimHandle::Start {
+                (start_s, secs_to_x(start_s), "START")
+            } else {
+                (end_s, secs_to_x(end_s), "END")
+            };
+            Some((ts, anchor_x, tag))
+        } else if let Some((hover_s, hx)) = hover_preview {
+            Some((hover_s, hx, "SEEK"))
+        } else if nudge_active {
+            let (ts, anchor_x, tag) = if self.trim_active_handle == TrimHandle::Start {
+                (start_s, secs_to_x(start_s), "START")
+            } else {
+                (end_s, secs_to_x(end_s), "END")
+            };
+            Some((ts, anchor_x, tag))
+        } else {
+            None
+        };
+
+        if let Some((preview_secs, anchor_x, tag_label)) = popover_info {
+            let pop_w = 204.0_f32;
+            let pop_h = 115.0_f32;
+            let pad = 4.0_f32;
+            let box_w = pop_w + pad * 2.0;
+            let box_h = pop_h + pad * 2.0;
+            let screen = ui.ctx().screen_rect();
+            let pop_x = (anchor_x - box_w * 0.5)
+                .clamp(screen.left() + 8.0, (screen.right() - box_w - 8.0).max(screen.left() + 8.0));
+            let pop_y = (bar_rect.top() - box_h - 10.0).max(screen.top() + 8.0);
+
+            let display_tex_id = self
+                .lookup_cached_frame(preview_secs, dur)
+                .map(|t| t.id())
+                .or_else(|| self.trim_last_displayed_frame.as_ref().map(|t| t.id()))
+                .or(fallback_thumb);
+            let is_loading = self.trim_frame_loading || self.trim_frame_pending.is_some();
+
+            egui::Area::new(egui::Id::new("trim_frame_preview_popover"))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .fixed_pos(Pos2::new(pop_x, pop_y))
+                .show(ui.ctx(), |ui| {
+                    let frame_resp = egui::Frame::none()
+                        .fill(Color32::from_rgb(10, 11, 13))
+                        .rounding(Rounding::same(6.0))
+                        .stroke(Stroke::new(1.0, BORDER_HOVER))
+                        .inner_margin(egui::Margin::same(pad))
+                        .show(ui, |ui| {
+                            let img_rect = if let Some(tid) = display_tex_id {
+                                let r = ui.add(
+                                    egui::Image::from_texture((tid, Vec2::new(pop_w, pop_h)))
+                                        .rounding(Rounding::same(3.0)),
+                                );
+                                ui.painter().rect_stroke(
+                                    r.rect,
+                                    Rounding::same(3.0),
+                                    Stroke::new(1.25, Color32::from_rgb(228, 232, 238)),
+                                );
+                                r.rect
+                            } else {
+                                let (r, _) =
+                                    ui.allocate_exact_size(Vec2::new(pop_w, pop_h), Sense::hover());
+                                ui.painter()
+                                    .rect_filled(r, Rounding::same(3.0), BG_ELEVATED);
+                                ui.painter().rect_stroke(
+                                    r,
+                                    Rounding::same(3.0),
+                                    Stroke::new(1.25, Color32::from_rgb(228, 232, 238)),
+                                );
+                                r
+                            };
+
+                            // Bottom-right timestamp stamp
+                            let ts_galley = ui.painter().layout_no_wrap(
+                                format_secs_hms(preview_secs),
+                                FontId::monospace(10.5),
+                                TEXT_PRIMARY,
+                            );
+                            let ts_size = ts_galley.size() + Vec2::new(10.0, 4.0);
+                            let ts_rect = Rect::from_min_size(
+                                Pos2::new(
+                                    img_rect.right() - ts_size.x - 5.0,
+                                    img_rect.bottom() - ts_size.y - 5.0,
+                                ),
+                                ts_size,
+                            );
+                            ui.painter().rect_filled(
+                                ts_rect,
+                                Rounding::same(4.0),
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 215),
+                            );
+                            ui.painter().galley(
+                                ts_rect.min + Vec2::new(5.0, 2.0),
+                                ts_galley,
+                                TEXT_PRIMARY,
+                            );
+
+                            // Bottom-left handle tag or loading status
+                            let badge_txt = if is_loading { "Loading frame..." } else { tag_label };
+                            let badge_col = if is_loading { ACCENT_GREEN } else { TEXT_MUTED };
+                            let lbl_galley = ui.painter().layout_no_wrap(
+                                badge_txt.to_string(),
+                                FontId::monospace(9.5),
+                                badge_col,
+                            );
+                            let lbl_size = lbl_galley.size() + Vec2::new(8.0, 4.0);
+                            let lbl_rect = Rect::from_min_size(
+                                Pos2::new(img_rect.left() + 5.0, img_rect.bottom() - lbl_size.y - 5.0),
+                                lbl_size,
+                            );
+                            ui.painter().rect_filled(
+                                lbl_rect,
+                                Rounding::same(4.0),
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 215),
+                            );
+                            ui.painter().galley(
+                                lbl_rect.min + Vec2::new(4.0, 2.0),
+                                lbl_galley,
+                                badge_col,
+                            );
+                        })
+                        .response
+                        .rect;
+
+                    // Small downward pointer caret aligned to anchor_x
+                    let tip_x = anchor_x.clamp(frame_resp.left() + 12.0, frame_resp.right() - 12.0);
+                    let base_y = frame_resp.bottom() - 0.5;
+                    ui.painter().add(Shape::convex_polygon(
+                        vec![
+                            Pos2::new(tip_x - 6.0, base_y),
+                            Pos2::new(tip_x + 6.0, base_y),
+                            Pos2::new(tip_x, base_y + 6.0),
+                        ],
+                        Color32::from_rgb(10, 11, 13),
+                        Stroke::new(1.0, BORDER_HOVER),
+                    ));
+                });
+        }
     }
 
     fn render_history_card(&self, ui: &mut egui::Ui, item: &DownloadItem) {
@@ -4404,6 +5549,7 @@ impl FiveKdApp {
 
 impl eframe::App for FiveKdApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.cancel_inflight_seek_frame();
         self.persist_config();
     }
 
@@ -4425,6 +5571,28 @@ impl eframe::App for FiveKdApp {
         if let Some((_, created_at)) = &self.paste_notice {
             if created_at.elapsed() >= Duration::from_secs(2) {
                 self.paste_notice = None;
+            }
+        }
+
+        // Expire keyboard-nudge frame preview popover cleanly
+        if let Some(until) = self.trim_preview_until {
+            if Instant::now() >= until {
+                self.trim_preview_until = None;
+            }
+        }
+
+        // Fire debounced seek frame extraction when scrubbing settles
+        if let Some((target_secs, scheduled_at)) = self.trim_frame_pending {
+            if scheduled_at.elapsed() >= Duration::from_millis(135) {
+                let dur = match &self.preview_state {
+                    VodPreviewState::Ready(d) => d.meta.duration_secs.unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                if dur > 0.5 {
+                    self.spawn_seek_frame_fetch(target_secs, dur);
+                } else {
+                    self.trim_frame_pending = None;
+                }
             }
         }
 
@@ -4854,7 +6022,7 @@ impl eframe::App for FiveKdApp {
                                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
                                 ui.label(RichText::new("Start").size(12.5).color(TEXT_MUTED));
-                                ui.add(
+                                let start_resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.start_time)
                                         .hint_text("00:00:00")
                                         .desired_width(92.0)
@@ -4865,7 +6033,7 @@ impl eframe::App for FiveKdApp {
 
                                 ui.add_space(8.0);
                                 ui.label(RichText::new("End").size(12.5).color(TEXT_MUTED));
-                                ui.add(
+                                let end_resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.end_time)
                                         .hint_text("HH:MM:SS")
                                         .desired_width(92.0)
@@ -4873,6 +6041,30 @@ impl eframe::App for FiveKdApp {
                                         .vertical_align(egui::Align::Center)
                                         .font(FontId::monospace(12.0)),
                                 );
+
+                                let preview_dur = match &self.preview_state {
+                                    VodPreviewState::Ready(d) => {
+                                        d.meta.duration_secs.filter(|&v| v.is_finite() && v > 0.5)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(dur) = preview_dur {
+                                    if start_resp.changed() {
+                                        self.trim_active_handle = TrimHandle::Start;
+                                        let (s, _) = self.resolve_trim_bounds(dur);
+                                        self.trim_preview_until =
+                                            Some(Instant::now() + Duration::from_millis(2000));
+                                        self.schedule_seek_frame_preview(s, dur, false, ui.ctx());
+                                        ui.ctx().request_repaint_after(Duration::from_millis(2050));
+                                    } else if end_resp.changed() {
+                                        self.trim_active_handle = TrimHandle::End;
+                                        let (_, e) = self.resolve_trim_bounds(dur);
+                                        self.trim_preview_until =
+                                            Some(Instant::now() + Duration::from_millis(2000));
+                                        self.schedule_seek_frame_preview(e, dur, false, ui.ctx());
+                                        ui.ctx().request_repaint_after(Duration::from_millis(2050));
+                                    }
+                                }
 
                                 ui.add_space(8.0);
                                 ui.label(RichText::new("Quality").size(12.5).color(TEXT_MUTED));

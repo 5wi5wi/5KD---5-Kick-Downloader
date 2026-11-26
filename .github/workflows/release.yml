@@ -214,8 +214,7 @@ jobs:
             | **macOS** | Intel (x86_64) | `5KD-macos-x86_64.tar.gz` |
 
             ## What's Changed
-            - fix(updater): replace Windows batch updater with a native headless update helper to prevent hanging `cmd`/`findstr` windows on Update & Restart
-            - feat(ui): add VOD Metadata Panel with thumbnail preview, stream info, available qualities, live size estimate, and prefetched metadata reuse
+            - feat/trim-seek-preview: add interactive VOD/clip trim seek bar with live frame preview popover, keyboard arrow nudging, and bidirectional Start/End time linking
           files: |
             release-assets/*
           draft: false
