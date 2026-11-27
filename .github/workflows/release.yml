@@ -215,6 +215,7 @@ jobs:
 
             ## What's Changed
             - feat/trim-seek-preview: add interactive VOD/clip trim seek bar with live frame preview popover, keyboard arrow nudging, and bidirectional Start/End time linking
+            - fix/trim-time-pills: fix reversed HH:MM:SS order inside Trim header timecode pills and missing arrow glyph between Start and End pills
           files: |
             release-assets/*
           draft: false

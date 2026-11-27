@@ -1684,7 +1684,7 @@ fn format_trim_precise(secs: f64) -> String {
 }
 
 fn format_trim_hms_parts(secs: f64) -> (String, String, String) {
-    let total = secs.max(0.0).floor() as u64;
+    let total = ((secs.max(0.0) * 1000.0).round() as u64) / 1000;
     (
         format!("{:02}", total / 3600),
         format!("{:02}", (total % 3600) / 60),
@@ -4989,48 +4989,30 @@ impl FiveKdApp {
                 let draw_time_pill = |ui: &mut egui::Ui, secs: f64, is_active: bool| -> egui::Response {
                     let (hh, mm, ss) = format_trim_hms_parts(secs);
                     let border = if is_active { ACCENT_GREEN } else { BORDER_SUBTLE };
+                    let mut job = egui::text::LayoutJob::default();
+                    let num_fmt = egui::TextFormat {
+                        font_id: FontId::monospace(12.5),
+                        color: TEXT_PRIMARY,
+                        ..Default::default()
+                    };
+                    let sep_fmt = egui::TextFormat {
+                        font_id: FontId::monospace(12.0),
+                        color: TEXT_MUTED,
+                        ..Default::default()
+                    };
+                    job.append(&hh, 0.0, num_fmt.clone());
+                    job.append(" : ", 0.0, sep_fmt.clone());
+                    job.append(&mm, 0.0, num_fmt.clone());
+                    job.append(" : ", 0.0, sep_fmt);
+                    job.append(&ss, 0.0, num_fmt);
+
                     let frame_resp = egui::Frame::none()
                         .fill(BG_ELEVATED)
                         .rounding(Rounding::same(8.0))
                         .stroke(Stroke::new(1.0, border))
                         .inner_margin(egui::Margin::symmetric(10.0, 5.0))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 3.0;
-                                ui.label(
-                                    RichText::new(hh)
-                                        .size(12.5)
-                                        .family(FontFamily::Monospace)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                );
-                                ui.label(
-                                    RichText::new(":")
-                                        .size(12.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(TEXT_MUTED),
-                                );
-                                ui.label(
-                                    RichText::new(mm)
-                                        .size(12.5)
-                                        .family(FontFamily::Monospace)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                );
-                                ui.label(
-                                    RichText::new(":")
-                                        .size(12.0)
-                                        .family(FontFamily::Monospace)
-                                        .color(TEXT_MUTED),
-                                );
-                                ui.label(
-                                    RichText::new(ss)
-                                        .size(12.5)
-                                        .family(FontFamily::Monospace)
-                                        .strong()
-                                        .color(TEXT_PRIMARY),
-                                );
-                            });
+                            ui.add(egui::Label::new(job).selectable(false));
                         })
                         .response
                         .interact(Sense::click());
@@ -5047,7 +5029,12 @@ impl FiveKdApp {
                     clicked_pill = Some(TrimHandle::End);
                 }
 
-                ui.label(RichText::new("→").size(13.0).color(TEXT_MUTED));
+                ui.label(
+                    RichText::new("→")
+                        .size(13.0)
+                        .family(FontFamily::Monospace)
+                        .color(TEXT_MUTED),
+                );
 
                 if draw_time_pill(ui, start_s, self.trim_active_handle == TrimHandle::Start)
                     .on_hover_text("Select Start handle (use ← → to nudge)")
