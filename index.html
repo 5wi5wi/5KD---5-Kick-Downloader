@@ -367,6 +367,32 @@
         color: var(--status-failed);
       }
 
+      .btn-secondary.btn-pause {
+        color: var(--status-canceled);
+      }
+
+      .btn-secondary.btn-pause:hover {
+        border-color: var(--status-canceled);
+        color: var(--status-canceled);
+      }
+
+      .btn-secondary.btn-resume {
+        color: var(--accent-green);
+        border-color: var(--accent-green);
+      }
+
+      .btn-secondary.btn-resume:hover {
+        border-color: var(--accent-green-hover);
+        color: var(--accent-green-hover);
+      }
+
+      .active-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+
       /* Stream Options Strip */
       .options-bar {
         flex-wrap: wrap;
@@ -1094,7 +1120,11 @@
         height: 100%;
         background: var(--accent-green);
         border-radius: 4px;
-        transition: width 0.2s ease;
+        transition: width 0.2s ease, background-color 0.14s ease;
+      }
+
+      .progress-fill.paused {
+        background: var(--status-canceled);
       }
 
       .progress-pct {
@@ -1725,6 +1755,19 @@
               https://github.com/mortyobnoxious/kickvod-extractor
             </a>
           </div>
+
+          <div class="card">
+            <div class="about-title-row" style="margin-bottom:6px;">
+              <div class="about-card-title" style="margin-bottom:0;">License</div>
+              <span class="about-version mono">· GNU GPL-3.0</span>
+            </div>
+            <p class="about-card-body">
+              5KD - 5wi's Kick Downloader is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License (GPL-3.0).
+            </p>
+            <a href="https://www.gnu.org/licenses/gpl-3.0.en.html" target="_blank" rel="noopener noreferrer" class="credit-link mono">
+              https://www.gnu.org/licenses/gpl-3.0.en.html
+            </a>
+          </div>
         </div>
       </main>
     </div>
@@ -2036,12 +2079,13 @@
           msg.includes('[updater error]')
         ) {
           line.classList.add('log-error');
-        } else if (msg.includes('[cancel]')) {
+        } else if (msg.includes('[cancel]') || msg.includes('[pause]')) {
           line.classList.add('log-cancel');
         } else if (
           msg.startsWith('>>>') ||
           msg.includes('Extracted Master M3U8') ||
           msg.includes('100% Completed') ||
+          msg.includes('[resume]') ||
           msg.includes('[updater] Update available:')
         ) {
           line.classList.add('log-accent');
@@ -2176,13 +2220,26 @@
         title.className = 'history-title';
         title.textContent = activeItem.title;
 
+        const actions = document.createElement('div');
+        actions.className = 'active-actions';
+
+        const pauseBtn = document.createElement('button');
+        pauseBtn.type = 'button';
+        pauseBtn.id = 'dl-pause-btn';
+        pauseBtn.className = activeItem.paused
+          ? 'btn-secondary btn-resume'
+          : 'btn-secondary btn-pause';
+        pauseBtn.textContent = activeItem.paused ? 'Resume' : 'Pause';
+        pauseBtn.addEventListener('click', togglePauseOngoingDownload);
+
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button';
         cancelBtn.className = 'btn-secondary btn-danger';
         cancelBtn.textContent = 'Cancel';
         cancelBtn.addEventListener('click', cancelOngoingDownload);
 
-        topRow.append(title, cancelBtn);
+        actions.append(pauseBtn, cancelBtn);
+        topRow.append(title, actions);
 
         const progRow = document.createElement('div');
         progRow.className = 'progress-row';
@@ -2191,7 +2248,7 @@
         track.className = 'progress-track';
         const fill = document.createElement('div');
         fill.id = 'prog-bar';
-        fill.className = 'progress-fill';
+        fill.className = activeItem.paused ? 'progress-fill paused' : 'progress-fill';
         fill.style.width = activeItem.pct + '%';
         track.appendChild(fill);
 
@@ -2210,6 +2267,17 @@
         fmtSpan.style.color = 'var(--accent-green)';
         fmtSpan.textContent = activeItem.resolution + ' · ' + activeItem.format;
 
+        meta.appendChild(fmtSpan);
+
+        if (activeItem.paused) {
+          const pauseSep = document.createElement('span');
+          pauseSep.textContent = '·';
+          const pauseTag = document.createElement('span');
+          pauseTag.className = 'mono status-canceled';
+          pauseTag.textContent = 'Paused';
+          meta.append(pauseSep, pauseTag);
+        }
+
         const sep = document.createElement('span');
         sep.textContent = '·';
 
@@ -2218,7 +2286,7 @@
         statusTxt.className = 'mono';
         statusTxt.textContent = activeItem.statusText;
 
-        meta.append(fmtSpan, sep, statusTxt);
+        meta.append(sep, statusTxt);
         card.append(topRow, progRow, meta);
         els.activeList.appendChild(card);
         updateBadges();
@@ -3470,6 +3538,23 @@
         }
       }
 
+      function togglePauseOngoingDownload() {
+        if (!activeItem) return;
+        activeItem.paused = !activeItem.paused;
+        if (activeItem.paused) {
+          if (activeItem.statusText !== 'Paused by user') {
+            activeItem.lastStatusText = activeItem.statusText;
+          }
+          activeItem.statusText = 'Paused by user';
+          logLine('[pause] Download paused by user: ' + activeItem.title);
+        } else {
+          activeItem.statusText =
+            activeItem.lastStatusText || 'Resuming stream via yt-dlp + ffmpeg...';
+          logLine('[resume] Download resumed by user: ' + activeItem.title);
+        }
+        renderActiveQueue();
+      }
+
       function cancelOngoingDownload() {
         if (!activeItem) return;
         activeCanceled = true;
@@ -3511,15 +3596,18 @@
         const fmtVal = currentExt.toUpperCase();
 
         activeCanceled = false;
+        const initialStatus = prefetchedMeta
+          ? 'Preparing stream via yt-dlp + ffmpeg...'
+          : 'Extracting Master M3U8 URL from Kick...';
         activeItem = {
           title: prefetchedMeta ? prefetchedMeta.title : 'Extracting VOD: ' + url,
           resolution: resVal,
           format: fmtVal,
           folder,
           pct: 4,
-          statusText: prefetchedMeta
-            ? 'Preparing stream via yt-dlp + ffmpeg...'
-            : 'Extracting Master M3U8 URL from Kick...'
+          paused: false,
+          statusText: initialStatus,
+          lastStatusText: initialStatus
         };
         els.urlInput.value = '';
         updateDownloadButtonState();
@@ -3550,7 +3638,10 @@
         activeItem.title = meta.title;
         activeItem.outputFile = finalOutputPath;
         activeItem.pct = 12;
-        activeItem.statusText = 'Saving as ' + finalOutputPath;
+        activeItem.lastStatusText = 'Saving as ' + finalOutputPath;
+        if (!activeItem.paused) {
+          activeItem.statusText = activeItem.lastStatusText;
+        }
         logLine('>>> Saving VOD/Clip as -> ' + finalOutputPath);
         renderActiveQueue();
 
@@ -3560,13 +3651,18 @@
             activeTimer = null;
             return;
           }
+          if (activeItem.paused) {
+            return;
+          }
           activeItem.pct = Math.min(activeItem.pct + 18, 100);
+          activeItem.lastStatusText = 'Downloading via yt-dlp + ffmpeg -> ' + finalOutputPath;
+          activeItem.statusText = activeItem.lastStatusText;
           const bar = document.getElementById('prog-bar');
           const pctEl = document.getElementById('prog-pct');
           const txt = document.getElementById('prog-txt');
           if (bar) bar.style.width = activeItem.pct + '%';
           if (pctEl) pctEl.textContent = activeItem.pct + '%';
-          if (txt) txt.textContent = 'Downloading via yt-dlp + ffmpeg -> ' + finalOutputPath;
+          if (txt) txt.textContent = activeItem.statusText;
 
           if (activeItem.pct >= 100) {
             clearInterval(activeTimer);

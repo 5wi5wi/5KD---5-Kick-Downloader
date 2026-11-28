@@ -3,6 +3,7 @@ name = "five_kd"
 version = "1.0.0"
 edition = "2021"
 description = "5KD - 5wi's Kick Downloader (Native Rust GUI with Integrated VOD Extractor)"
+license = "GPL-3.0-only"
 
 [[bin]]
 name = "5KD"

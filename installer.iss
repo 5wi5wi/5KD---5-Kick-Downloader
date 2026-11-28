@@ -47,6 +47,7 @@ Compression=lzma2/fast
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
+LicenseFile=LICENSE
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

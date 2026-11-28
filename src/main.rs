@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io::{BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as UnixCommandExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -382,7 +384,10 @@ struct DownloadItem {
     format: &'static str,
     progress: f32,
     status_text: String,
+    last_status_text: String,
     status: DownloadStatus,
+    paused: bool,
+    pause_flag: Arc<AtomicBool>,
     cancel_flag: Arc<AtomicBool>,
     child_pid: Arc<Mutex<Option<u32>>>,
 }
@@ -2099,6 +2104,220 @@ fn probe_hls_variants_for_preview(m3u8_url: &str) -> HlsPreviewProbe {
     result
 }
 
+#[cfg(target_os = "windows")]
+mod win_proc {
+    use std::ffi::c_void;
+    use std::mem::{size_of, transmute, zeroed};
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    type NtProcessFn = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> *mut c_void;
+        fn Process32FirstW(h_snapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(h_snapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn OpenProcess(
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            dw_process_id: u32,
+        ) -> *mut c_void;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+        fn GetModuleHandleA(lp_module_name: *const u8) -> *mut c_void;
+        fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *const c_void;
+    }
+
+    fn collect_process_tree(root_pid: u32) -> Vec<u32> {
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if !snap.is_null() && snap != INVALID_HANDLE_VALUE {
+                let mut entry: ProcessEntry32W = zeroed();
+                entry.dw_size = size_of::<ProcessEntry32W>() as u32;
+                if Process32FirstW(snap, &mut entry) != 0 {
+                    loop {
+                        pairs.push((entry.th32_process_id, entry.th32_parent_process_id));
+                        if Process32NextW(snap, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snap);
+            }
+        }
+
+        let mut pids = vec![root_pid];
+        let mut idx = 0;
+        while idx < pids.len() {
+            let current = pids[idx];
+            idx += 1;
+            for &(pid, ppid) in &pairs {
+                if ppid == current && !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+        pids
+    }
+
+    pub fn set_process_tree_paused(root_pid: u32, paused: bool) -> bool {
+        if root_pid <= 1 {
+            return false;
+        }
+        let proc_name: &[u8] = if paused {
+            b"NtSuspendProcess\0"
+        } else {
+            b"NtResumeProcess\0"
+        };
+        unsafe {
+            let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+            if ntdll.is_null() {
+                return false;
+            }
+            let addr = GetProcAddress(ntdll, proc_name.as_ptr());
+            if addr.is_null() {
+                return false;
+            }
+            let func: NtProcessFn = transmute(addr);
+            let mut any_ok = false;
+            for pid in collect_process_tree(root_pid) {
+                let handle = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+                if !handle.is_null() {
+                    if func(handle) == 0 {
+                        any_ok = true;
+                    }
+                    CloseHandle(handle);
+                }
+            }
+            any_ok
+        }
+    }
+}
+
+#[cfg(unix)]
+mod unix_proc {
+    #[cfg(target_os = "linux")]
+    const SIGSTOP: i32 = 19;
+    #[cfg(target_os = "linux")]
+    const SIGCONT: i32 = 18;
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    const SIGSTOP: i32 = 17;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    const SIGCONT: i32 = 19;
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    const SIGSTOP: i32 = 19;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    const SIGCONT: i32 = 18;
+
+    const SIGKILL: i32 = 9;
+
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    pub fn set_process_tree_paused(root_pid: u32, paused: bool) -> bool {
+        if root_pid <= 1 || root_pid > i32::MAX as u32 {
+            return false;
+        }
+        let sig = if paused { SIGSTOP } else { SIGCONT };
+        let pgid = -(root_pid as i32);
+        unsafe {
+            if kill(pgid, sig) == 0 {
+                true
+            } else {
+                kill(root_pid as i32, sig) == 0
+            }
+        }
+    }
+
+    pub fn kill_process_group(root_pid: u32) {
+        if root_pid <= 1 || root_pid > i32::MAX as u32 {
+            return;
+        }
+        let pgid = -(root_pid as i32);
+        unsafe {
+            let _ = kill(pgid, SIGKILL);
+            let _ = kill(root_pid as i32, SIGKILL);
+        }
+    }
+}
+
+fn set_process_tree_paused(pid: u32, paused: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win_proc::set_process_tree_paused(pid, paused)
+    }
+    #[cfg(unix)]
+    {
+        unix_proc::set_process_tree_paused(pid, paused)
+    }
+    #[cfg(all(not(target_os = "windows"), not(unix)))]
+    {
+        let _ = (pid, paused);
+        false
+    }
+}
+
+fn kill_process_tree_by_pid(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        kill_process_by_pid(pid);
+    }
+    #[cfg(unix)]
+    {
+        unix_proc::kill_process_group(pid);
+    }
+    #[cfg(all(not(target_os = "windows"), not(unix)))]
+    {
+        kill_process_by_pid(pid);
+    }
+}
+
 fn kill_process_by_pid(pid: u32) {
     let pid_str = pid.to_string();
     #[cfg(target_os = "windows")]
@@ -2841,6 +3060,10 @@ fn draw_nav_icon(ui: &mut egui::Ui, tab: Tab, size: f32, color: Color32) {
 
 /// Sleek 8px progress bar inside a single-line horizontal layout (never expands vertically).
 fn draw_progress_row(ui: &mut egui::Ui, progress: f32) {
+    draw_progress_row_colored(ui, progress, ACCENT_GREEN);
+}
+
+fn draw_progress_row_colored(ui: &mut egui::Ui, progress: f32, fill_color: Color32) {
     let clamped = progress.clamp(0.0, 1.0);
     let pct_val = clamped * 100.0;
     let pct_label = if pct_val >= 99.95 {
@@ -2860,7 +3083,7 @@ fn draw_progress_row(ui: &mut egui::Ui, progress: f32) {
         if fill_w > 0.0 {
             let fill_rect =
                 Rect::from_min_size(track_rect.min, Vec2::new(fill_w, track_rect.height()));
-            painter.rect_filled(fill_rect, Rounding::same(4.0), ACCENT_GREEN);
+            painter.rect_filled(fill_rect, Rounding::same(4.0), fill_color);
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3742,32 +3965,55 @@ impl FiveKdApp {
         !self.output_path.trim().is_empty()
     }
 
+    fn toggle_pause_download(&mut self, id: usize) {
+        let mut log_msg: Option<String> = None;
+        if let Some(item) = self.active_downloads.iter_mut().find(|i| i.id == id) {
+            let next_paused = !item.paused;
+            item.paused = next_paused;
+            item.pause_flag.store(next_paused, Ordering::SeqCst);
+
+            if let Ok(guard) = item.child_pid.lock() {
+                if let Some(pid) = *guard {
+                    let _ = set_process_tree_paused(pid, next_paused);
+                }
+            }
+
+            if next_paused {
+                if item.status_text != "Paused by user" {
+                    item.last_status_text = item.status_text.clone();
+                }
+                item.status_text = "Paused by user".to_string();
+                log_msg = Some(format!(
+                    "[pause] Download #{} paused by user: {}",
+                    id, item.title
+                ));
+            } else {
+                item.status_text = if item.last_status_text.is_empty() {
+                    "Resuming stream via yt-dlp + ffmpeg...".to_string()
+                } else {
+                    item.last_status_text.clone()
+                };
+                log_msg = Some(format!(
+                    "[resume] Download #{} resumed by user: {}",
+                    id, item.title
+                ));
+            }
+        }
+        if let Some(msg) = log_msg {
+            self.push_log(msg);
+        }
+    }
+
     fn cancel_download(&mut self, id: usize) {
         if let Some(pos) = self.active_downloads.iter().position(|i| i.id == id) {
             let mut item = self.active_downloads.remove(pos);
             item.cancel_flag.store(true, Ordering::SeqCst);
+            item.pause_flag.store(false, Ordering::SeqCst);
+            item.paused = false;
 
             if let Ok(guard) = item.child_pid.lock() {
                 if let Some(pid) = *guard {
-                    let pid_str = pid.to_string();
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _ = Command::new("taskkill")
-                            .args(["/F", "/T", "/PID", &pid_str])
-                            .creation_flags(CREATE_NO_WINDOW)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn();
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        let _ = Command::new("kill")
-                            .args(["-9", &pid_str])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn();
-                    }
+                    kill_process_tree_by_pid(pid);
                 }
             }
 
@@ -4038,6 +4284,7 @@ impl FiveKdApp {
         let ext = self.container_ext;
         let custom_out = self.output_path.trim().to_string();
 
+        let pause_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let child_pid = Arc::new(Mutex::new(None));
 
@@ -4060,8 +4307,11 @@ impl FiveKdApp {
             resolution: res.short_label(),
             format: ext.upper(),
             progress: 0.0,
-            status_text: initial_status,
+            status_text: initial_status.clone(),
+            last_status_text: initial_status,
             status: DownloadStatus::Active,
+            paused: false,
+            pause_flag: pause_flag.clone(),
             cancel_flag: cancel_flag.clone(),
             child_pid: child_pid.clone(),
         };
@@ -4129,6 +4379,12 @@ impl FiveKdApp {
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
+            while pause_flag.load(Ordering::SeqCst) {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(120));
+            }
 
             // Pull the VOD/Clip title and make it the name of the output file
             let final_output = build_output_filepath(
@@ -4180,6 +4436,8 @@ impl FiveKdApp {
 
             #[cfg(target_os = "windows")]
             cmd.creation_flags(CREATE_NO_WINDOW);
+            #[cfg(unix)]
+            cmd.process_group(0);
 
             let _ = tx.send(WorkerEvent::Log(format!(
                 ">>> Saving VOD/Clip as -> {}",
@@ -4189,12 +4447,17 @@ impl FiveKdApp {
 
             match cmd.spawn() {
                 Ok(mut child) => {
+                    let spawned_pid = child.id();
                     if let Ok(mut guard) = child_pid.lock() {
-                        *guard = Some(child.id());
+                        *guard = Some(spawned_pid);
                     }
                     if cancel_flag.load(Ordering::SeqCst) {
                         let _ = child.kill();
+                        kill_process_tree_by_pid(spawned_pid);
                         return;
+                    }
+                    if pause_flag.load(Ordering::SeqCst) {
+                        let _ = set_process_tree_paused(spawned_pid, true);
                     }
 
                     if let Some(stderr) = child.stderr.take() {
@@ -4336,7 +4599,11 @@ impl FiveKdApp {
                             meta.session_title, meta.duration_formatted
                         );
                         item.url = meta.m3u8_url;
-                        item.status_text = "Downloading stream via yt-dlp + ffmpeg...".to_string();
+                        let active_msg = "Downloading stream via yt-dlp + ffmpeg...".to_string();
+                        item.last_status_text = active_msg.clone();
+                        if !item.paused {
+                            item.status_text = active_msg;
+                        }
                     }
                 }
                 WorkerEvent::Progress(id, prog, status) => {
@@ -4344,7 +4611,10 @@ impl FiveKdApp {
                         if prog >= 0.0 && prog > item.progress {
                             item.progress = prog;
                         }
-                        item.status_text = status;
+                        item.last_status_text = status.clone();
+                        if !item.paused {
+                            item.status_text = status;
+                        }
                     }
                 }
                 WorkerEvent::Finished(id, success, msg, saved_path) => {
@@ -6266,6 +6536,7 @@ impl eframe::App for FiveKdApp {
                                         );
                                     });
                             } else {
+                                let mut toggle_pause_target_id: Option<usize> = None;
                                 let mut cancel_target_id: Option<usize> = None;
 
                                 for item in &self.active_downloads {
@@ -6278,9 +6549,12 @@ impl eframe::App for FiveKdApp {
                                             ui.set_min_width(ui.available_width());
                                             ui.horizontal(|ui| {
                                                 let cancel_w = 72.0;
-                                                let title_w =
-                                                    (ui.available_width() - cancel_w - 10.0)
-                                                        .max(80.0);
+                                                let pause_w = 76.0;
+                                                let title_w = (ui.available_width()
+                                                    - cancel_w
+                                                    - pause_w
+                                                    - 18.0)
+                                                    .max(80.0);
                                                 ui.allocate_ui_with_layout(
                                                     Vec2::new(title_w, 28.0),
                                                     egui::Layout::left_to_right(
@@ -6314,11 +6588,45 @@ impl eframe::App for FiveKdApp {
                                                         if ui.add(cancel_btn).clicked() {
                                                             cancel_target_id = Some(item.id);
                                                         }
+
+                                                        ui.add_space(6.0);
+
+                                                        let (pause_lbl, pause_color, pause_border) =
+                                                            if item.paused {
+                                                                (
+                                                                    "Resume",
+                                                                    ACCENT_GREEN,
+                                                                    ACCENT_GREEN,
+                                                                )
+                                                            } else {
+                                                                (
+                                                                    "Pause",
+                                                                    STATUS_CANCELED,
+                                                                    BORDER_HOVER,
+                                                                )
+                                                            };
+                                                        let pause_btn = styled_secondary_btn(
+                                                            pause_lbl,
+                                                            pause_color,
+                                                            pause_border,
+                                                            Vec2::new(pause_w, 28.0),
+                                                        );
+                                                        if ui.add(pause_btn).clicked() {
+                                                            toggle_pause_target_id = Some(item.id);
+                                                        }
                                                     },
                                                 );
                                             });
                                             ui.add_space(8.0);
-                                            draw_progress_row(ui, item.progress);
+                                            draw_progress_row_colored(
+                                                ui,
+                                                item.progress,
+                                                if item.paused {
+                                                    STATUS_CANCELED
+                                                } else {
+                                                    ACCENT_GREEN
+                                                },
+                                            );
                                             ui.add_space(6.0);
                                             ui.horizontal(|ui| {
                                                 ui.label(
@@ -6330,6 +6638,20 @@ impl eframe::App for FiveKdApp {
                                                     .family(FontFamily::Monospace)
                                                     .color(ACCENT_GREEN),
                                                 );
+                                                if item.paused {
+                                                    ui.label(
+                                                        RichText::new("·")
+                                                            .size(11.5)
+                                                            .color(TEXT_MUTED),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new("Paused")
+                                                            .size(11.5)
+                                                            .family(FontFamily::Monospace)
+                                                            .strong()
+                                                            .color(STATUS_CANCELED),
+                                                    );
+                                                }
                                                 ui.label(
                                                     RichText::new("·")
                                                         .size(11.5)
@@ -6349,6 +6671,9 @@ impl eframe::App for FiveKdApp {
                                     ui.add_space(8.0);
                                 }
 
+                                if let Some(id_to_toggle) = toggle_pause_target_id {
+                                    self.toggle_pause_download(id_to_toggle);
+                                }
                                 if let Some(id_to_cancel) = cancel_target_id {
                                     self.cancel_download(id_to_cancel);
                                 }
@@ -6438,10 +6763,13 @@ impl eframe::App for FiveKdApp {
                                                 || line.contains("[updater error]")
                                             {
                                                 STATUS_FAILED
-                                            } else if line.contains("[cancel]") {
+                                            } else if line.contains("[cancel]")
+                                                || line.contains("[pause]")
+                                            {
                                                 STATUS_CANCELED
                                             } else if line.starts_with(">>>")
                                                 || line.contains("Extracted '")
+                                                || line.contains("[resume]")
                                                 || line.contains("[updater] Update available:")
                                             {
                                                 ACCENT_GREEN
@@ -6851,6 +7179,41 @@ impl eframe::App for FiveKdApp {
                                     ui.hyperlink(
                                         "https://github.com/mortyobnoxious/kickvod-extractor",
                                     );
+                                });
+
+                            ui.add_space(12.0);
+
+                            egui::Frame::none()
+                                .fill(BG_SURFACE)
+                                .rounding(Rounding::same(10.0))
+                                .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                .inner_margin(egui::Margin::same(16.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("License")
+                                                .size(14.5)
+                                                .strong()
+                                                .color(TEXT_PRIMARY),
+                                        );
+                                        ui.label(
+                                            RichText::new("· GNU GPL-3.0")
+                                                .size(12.5)
+                                                .family(FontFamily::Monospace)
+                                                .color(ACCENT_GREEN),
+                                        );
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "5KD - 5wi's Kick Downloader is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License (GPL-3.0).",
+                                        )
+                                        .size(13.0)
+                                        .color(TEXT_MUTED),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.hyperlink("https://www.gnu.org/licenses/gpl-3.0.en.html");
                                 });
                         });
                 }

@@ -214,8 +214,8 @@ jobs:
             | **macOS** | Intel (x86_64) | `5KD-macos-x86_64.tar.gz` |
 
             ## What's Changed
-            - feat/trim-seek-preview: add interactive VOD/clip trim seek bar with live frame preview popover, keyboard arrow nudging, and bidirectional Start/End time linking
-            - fix/trim-time-pills: fix reversed HH:MM:SS order inside Trim header timecode pills and missing arrow glyph between Start and End pills
+            - feat/pause-resume-downloads: add Pause/Resume button in Active Queue to suspend and resume ongoing VOD/clip downloads across Windows, Linux, and macOS
+            - feat/gpl3-license: add GNU GPL-3.0 license file, Cargo metadata, README license section, and About tab license card
           files: |
             release-assets/*
           draft: false

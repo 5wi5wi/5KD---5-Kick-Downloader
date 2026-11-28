@@ -30,7 +30,7 @@
   - Checks GitHub Releases automatically on launch (configurable) or manually from the **About** tab, downloads the matching platform package in-app, installs silently, cleans up temporary installer files, and restarts automatically.
 - **Persistent Preferences, Queue Controls & Live Terminal**:
   - Remembers your chosen output folder, quality, container format, UI zoom (`100%`–`150%`), and update settings across restarts.
-  - Includes clipboard **Paste**, clean process-tree **Cancel** on active downloads, **Open Folder** / reveal file on completed downloads, and real-time stdout/stderr inspection in the **Terminal** tab.
+  - Includes clipboard **Paste**, **Pause / Resume** and clean process-tree **Cancel** on active downloads, **Open Folder** / reveal file on completed downloads, and real-time stdout/stderr inspection in the **Terminal** tab.
 
 ---
 
@@ -158,7 +158,7 @@ To cross-compile for the other macOS architecture on the same Mac, add the targe
 3. **Paste URL & Download**:
    - Paste any Kick VOD URL (`https://kick.com/channel/videos/uuid`), Clip URL, or direct `.m3u8` URL into the top input bar (or click **Paste**) and click **Download**.
    - Track exact 1-decimal percentage, frame progress, elapsed/total timestamp, and speed in **Active Queue**, or inspect live logs in the **Terminal** tab.
-   - Click **Cancel** at any time to cleanly terminate an ongoing download.
+   - Click **Pause** / **Resume** to suspend or continue an active download, or **Cancel** at any time to cleanly terminate it.
 
 ---
 
@@ -166,6 +166,7 @@ To cross-compile for the other macOS architecture on the same Mac, add the targe
 
 ```text
 ├── Cargo.toml                     # Rust crate manifest & dependencies (eframe, egui, reqwest, rfd, serde, serde_json, arboard)
+├── LICENSE                        # GNU General Public License v3.0 (GPL-3.0)
 ├── build.rs                       # Embeds multi-size geometric 5KD .ico on Windows & injects build version/repo metadata
 ├── installer.iss                  # Inno Setup 6 Windows Setup Wizard installer script
 ├── build_release.bat              # One-click Windows release binary & setup installer builder
@@ -183,3 +184,9 @@ To cross-compile for the other macOS architecture on the same Mac, add the targe
 - **M3U8 URL Extractor**: Adapted from [**kickvod-extractor**](https://github.com/mortyobnoxious/kickvod-extractor) by [@mortyobnoxious](https://github.com/mortyobnoxious).
 - **Stream Downloading, Probing & Muxing**: Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [FFmpeg / ffprobe](https://ffmpeg.org/).
 - **GUI Framework**: Built with [egui / eframe](https://github.com/emilk/egui).
+
+---
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)** — see the [LICENSE](LICENSE) file or [gnu.org/licenses/gpl-3.0](https://www.gnu.org/licenses/gpl-3.0.en.html) for full details.
